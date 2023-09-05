@@ -30,7 +30,7 @@ impl Ship {
                 target_timeout: 2.,
             },
             tracking: false,
-            aim: AimPid::new(100., 0., -110000.),
+            aim: AimPid::new(100., 0., -110_000.),
         }
     }
 
@@ -40,7 +40,7 @@ impl Ship {
             self.tracking = !track_lost;
             if let Some(contact) = contact {
                 self.target
-                    .integrate_data(contact.position, contact.velocity, 0.5);
+                    .integrate_data(contact.position, contact.velocity, 0.75);
             }
             self.target.debug();
         } else {
@@ -52,26 +52,44 @@ impl Ship {
                 self.aim.reset();
             }
         }
-        debug!("tracking {}", self.tracking);
-        let x = projectile_impact_time2(&self.target, BULLET_SPEED);
-        debug!("{}", x);
-        let aim_pos = rel_vel_target_pos(&self.target, x);
-        //debug!("it {}", projectile_impact_time(&self.target, BULLET_SPEED));
-        draw_diamond(aim_pos, 5., 0xFFFF_0000);
-        draw_diamond(self.target.position_in(x), 10., 0xFFFF_FF00);
+        let bullet_impact_time = projectile_impact_time2(&self.target, BULLET_SPEED);
+        let aim_pos = rel_vel_target_pos(&self.target, bullet_impact_time);
         let turn_torque = self.aim.aim_torque((aim_pos - position()).angle());
-        debug!("t: {}", turn_torque);
-        draw_line(
-            position(),
-            position() + vec2(100000., 0.).rotate(heading()),
-            0xFFFF_FFFF,
-        );
         torque(turn_torque);
         if angle_diff(heading(), (aim_pos - position()).angle()).abs() < 0.01 * TAU {
             fire(0);
         }
-        accelerate(aim_pos - position());
+
+        kite(&self.target, 3500., 200.);
+
+        debug!("tracking {}", self.tracking);
+        draw_diamond(aim_pos, 5., 0xFFFF_0000);
+        draw_diamond(
+            self.target.position_in(bullet_impact_time),
+            10.,
+            0xFFFF_FF00,
+        );
+        draw_line(
+            position(),
+            position() + vec2(100_000., 0.).rotate(heading()),
+            0xFFFF_FFFF,
+        );
     }
+}
+
+fn kite(target: &TargetInfo, distance: f64, desired_side_speed: f64) {
+    let target_dir = dir(position(), target.position());
+    let towards_speed = (velocity() - target.vel).dot(target_dir);
+    let side_speed = (velocity() - target.vel).dot(target_dir.rotate(0.25 * TAU));
+
+    let target_dist = position().distance(target.position());
+    let desired_towards_speed = (target_dist - distance) / 10.;
+
+    let towards_acc = target_dir * (desired_towards_speed - towards_speed);
+    let side_acc = target_dir.rotate(0.25 * TAU) * (desired_side_speed - side_speed);
+
+    let acc = (towards_acc + side_acc) * max_forward_acceleration();
+    accelerate(acc);
 }
 
 struct RadarSearch {
@@ -84,7 +102,7 @@ impl RadarSearch {
     const HEADING_STEP: f64 = 0.25 * TAU + 0.5 * Self::FOV;
 
     fn search(&mut self) {
-        self.targets.iter().for_each(|t| t.debug());
+        self.targets.iter().for_each(TargetInfo::debug);
         set_radar_width(Self::FOV);
         set_radar_heading(radar_heading() + Self::HEADING_STEP);
         set_radar_min_distance(0.);
@@ -96,7 +114,7 @@ impl RadarSearch {
                 .iter_mut()
                 .find(|t| t.position().distance(contact.position) < self.target_fuse_dist)
             {
-                fuse_target.integrate_data(contact.position, contact.velocity, 0.75);
+                fuse_target.integrate_data(contact.position, contact.velocity, 1.);
             } else {
                 self.targets.push(TargetInfo {
                     pos: contact.position,
@@ -135,6 +153,8 @@ impl RadarTrack {
 
         let distance = towards_target.length();
         let err = delta_time(self.last_contact_time) * self.err_per_sec;
+
+        debug!("err: {}, md: {}", err, distance + 100. + err);
 
         set_radar_max_distance(distance + 100. + err);
         set_radar_min_distance(distance - 100. - err);
@@ -193,8 +213,8 @@ impl TargetInfo {
         draw_diamond(self.position(), 100., 0xFFFF_FFFF);
         draw_triangle(self.pos, 100., 0xFFFF_FFFF);
         draw_line(self.pos, self.pos + self.vel, 0xFFFF_FFFF);
-        draw_line(self.pos, self.pos + self.acc, 0xFFC86400);
-        draw_text!(self.pos, 0xFF646464, "{}", delta_time(self.t));
+        draw_line(self.pos, self.pos + self.acc, 0xFFC8_6400);
+        draw_text!(self.pos, 0xFF64_6464, "{}", delta_time(self.t));
     }
 
     fn integrate_data(&mut self, position: Vec2, velocity: Vec2, importance: f64) {

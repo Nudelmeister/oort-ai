@@ -181,7 +181,7 @@ impl Fighter {
             search: RadarSearch {
                 targets: Vec::new(),
                 target_fuse_dist: 100.,
-                target_timeout: 2.,
+                target_timeout: 0.25,
             },
             tracking: false,
             aim: AimPid::new(100., 0., -110_000.),
@@ -190,14 +190,14 @@ impl Fighter {
     }
 
     pub fn tick(&mut self) {
+        self.target.debug();
         if self.tracking {
             let (contact, track_lost) = self.track.track(self.target.position());
-            self.tracking = !track_lost;
             if let Some(contact) = contact {
                 self.target
                     .integrate_data(contact.position, contact.velocity, 0.75);
             }
-            self.target.debug();
+            self.tracking = !track_lost;
         } else {
             self.search.search();
             if let Some(target) = self.search.in_front_target() {
@@ -208,7 +208,7 @@ impl Fighter {
             }
         }
 
-        if reload_ticks(1) == 0 {
+        if reload_ticks(1) == 0 && self.tracking {
             fire(1);
             self.missile_fire_tick = current_tick();
         }
@@ -222,7 +222,7 @@ impl Fighter {
         //let aim_pos = rel_vel_target_pos(&self.target, bullet_impact_time);
         let turn_torque = self
             .aim
-            .aim_torque((self.target.position() - position()).angle() + rand(-0.1, 0.1));
+            .aim_torque((self.target.position() - position()).angle() + rand(-0.05, 0.05));
         torque(turn_torque);
         //if angle_diff(heading(), (aim_pos - position()).angle()).abs() < 0.01 * TAU {
         fire(0);
@@ -256,10 +256,13 @@ fn kite(target: &TargetInfo, distance: f64, desired_side_speed: f64) {
     let towards_acc = target_dir * (desired_towards_speed - towards_speed);
     let side_acc = target_dir.rotate(0.25 * TAU) * (desired_side_speed - side_speed);
 
-    let towards_center_acc = if position().length() < 18_000. {
+    let towards_center_acc = if position().length() < 19_000.
+        && (position().length() < 15_000. || velocity().dot(position()) < 0.)
+    {
         vec2(0., 0.)
     } else {
-        -position() * 0.5
+        debug!("avoid death by cowardice");
+        -position() * 0.1
     };
     let acc = (towards_acc + side_acc + towards_center_acc) * max_forward_acceleration();
     accelerate(acc);
@@ -337,6 +340,7 @@ impl RadarTrack {
         if contact.is_some() {
             self.last_contact_time = current_time();
         }
+        debug!("{}", err);
         (contact, err > 1000.)
     }
 }
@@ -480,8 +484,6 @@ impl AimPid {
         self.last_diff = diff;
         self.accumulated_diff += self.i * diff * delta;
         self.last_time = current_time();
-        debug!("p {}, i {}, d {}", p_term, i_term, d_term);
-
         p_term + d_term
     }
 }

@@ -2,14 +2,10 @@ use oort_api::prelude::*;
 
 const BULLET_SPEED: f64 = 1000.0; // m/s
 
-pub struct Ship {
-    target: TargetInfo,
-    track: RadarTrack,
-    search: RadarSearch,
-    tracking: bool,
-    aim: AimPid,
+pub enum Ship {
+    Fighter(Fighter),
+    Missile(Missile),
 }
-
 impl Default for Ship {
     fn default() -> Self {
         Self::new()
@@ -17,8 +13,166 @@ impl Default for Ship {
 }
 
 impl Ship {
-    pub fn new() -> Ship {
-        Ship {
+    pub fn new() -> Self {
+        match class() {
+            Class::Fighter => Self::Fighter(Fighter::new()),
+            Class::Missile => Self::Missile(Missile::new()),
+            _ => unimplemented!(),
+        }
+    }
+    pub fn tick(&mut self) {
+        match self {
+            Self::Fighter(inner) => inner.tick(),
+            Self::Missile(inner) => inner.tick(),
+        }
+    }
+}
+
+pub struct Missile {
+    target: Option<TargetInfo>,
+    sweep: RadarSweep,
+    track: RadarTrack,
+    tracking: bool,
+    closest_dist: f64,
+}
+impl Default for Missile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Missile {
+    const FUSE_DISTANCE: f64 = 250.;
+    const MIN_DISTANCE: f64 = 50.;
+
+    pub fn new() -> Self {
+        Self {
+            target: None,
+            sweep: RadarSweep {
+                max_angle: 0.06 * TAU,
+                min_fov: 0.001 * TAU,
+                max_fov: 0.0025 * TAU,
+                fov_step: 0.001 * TAU,
+            },
+            track: RadarTrack {
+                last_contact_time: 0.,
+                err_per_sec: 3000.,
+            },
+            tracking: true,
+            closest_dist: f64::MAX,
+        }
+    }
+    pub fn tick(&mut self) {
+        let Some(target) = self.target.as_mut() else {
+            self.receive_target();
+            return;
+        };
+        target.debug();
+        if self.tracking {
+            let (contact, track_lost) = self.track.track(target.position());
+            self.tracking = !track_lost;
+            if let Some(contact) = contact {
+                if contact.class != Class::Missile {
+                    target.integrate_data(contact.position, contact.velocity, 0.75);
+                }
+            }
+        } else if let Some(contact) = self.sweep.sweep(target.position()) {
+            if contact.class != Class::Missile {
+                self.tracking = true;
+                self.track.last_contact_time = current_time();
+                target.integrate_data(contact.position, contact.velocity, 1.);
+            }
+        }
+
+        let tti = Self::time_to_impact(target);
+        let impact_pos = target.position_in(tti);
+        draw_diamond(impact_pos, 50., 0xFFFF_FFFF);
+        debug!("Boom in {:.2}s", tti);
+
+        let towards_target = target.position() - position();
+
+        if fuel() > 25. {
+            let acc_power = fuel() / tti.abs();
+            if (0. ..=10.).contains(&tti) {
+                let towards_impact = impact_pos - position();
+                let sideways_dir = towards_impact.normalize().rotate(0.25 * TAU);
+                let sideways_vel = velocity().dot(sideways_dir);
+                let sideways_factor = 1000. * towards_impact.length().recip();
+                let accel =
+                    towards_impact.normalize() - sideways_dir * sideways_vel * sideways_factor;
+                turn(10. * angle_diff(heading(), accel.angle()));
+                accelerate(accel.normalize() * 0.8 * acc_power);
+            } else if fuel() > 800. {
+                turn(20. * angle_diff(heading(), towards_target.angle()));
+                accelerate(towards_target.normalize() * max_forward_acceleration());
+            }
+        } else {
+            accelerate(vec2(0., 0.));
+        }
+
+        self.trigger();
+    }
+    fn trigger(&mut self) {
+        let Some(distance) = self.target.map(|t| t.position().distance(position())) else {
+            return;
+        };
+        if distance < Self::MIN_DISTANCE
+            || self.closest_dist < Self::FUSE_DISTANCE && distance > self.closest_dist
+        {
+            explode();
+        }
+        if self.closest_dist > distance {
+            self.closest_dist = distance;
+        }
+    }
+    fn receive_target(&mut self) {
+        if let Some([px, py, vx, vy]) = receive() {
+            let target = TargetInfo {
+                pos: vec2(px, py),
+                vel: vec2(vx, vy),
+                acc: vec2(0., 0.),
+                t: current_time(),
+            };
+            self.target = Some(target);
+        }
+    }
+    fn time_to_impact(target: &TargetInfo) -> f64 {
+        let towards_target = target.position() - position();
+        let towards_target_dir = towards_target.normalize();
+        let closing_speed =
+            velocity().dot(towards_target_dir) + target.vel.dot(-towards_target_dir);
+
+        let distance = towards_target.length();
+        let mut time = distance / closing_speed;
+        let acc_power = fuel() / time.abs();
+        let closing_acc =
+            0.5 * max_forward_acceleration().min(acc_power) + target.acc.dot(-towards_target_dir);
+
+        for _ in 0..10 {
+            time = distance / (closing_speed + closing_acc * time * 0.5);
+        }
+        time
+    }
+}
+
+pub struct Fighter {
+    target: TargetInfo,
+    track: RadarTrack,
+    search: RadarSearch,
+    tracking: bool,
+    aim: AimPid,
+    missile_fire_tick: u32,
+}
+
+impl Default for Fighter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fighter {
+    pub fn new() -> Fighter {
+        Fighter {
             target: TargetInfo::default(),
             track: RadarTrack {
                 last_contact_time: 0.,
@@ -31,6 +185,7 @@ impl Ship {
             },
             tracking: false,
             aim: AimPid::new(100., 0., -110_000.),
+            missile_fire_tick: u32::MAX,
         }
     }
 
@@ -52,23 +207,36 @@ impl Ship {
                 self.aim.reset();
             }
         }
-        let bullet_impact_time = projectile_impact_time2(&self.target, BULLET_SPEED);
-        let aim_pos = rel_vel_target_pos(&self.target, bullet_impact_time);
-        let turn_torque = self.aim.aim_torque((aim_pos - position()).angle());
-        torque(turn_torque);
-        if angle_diff(heading(), (aim_pos - position()).angle()).abs() < 0.01 * TAU {
-            fire(0);
+
+        if reload_ticks(1) == 0 {
+            fire(1);
+            self.missile_fire_tick = current_tick();
+        }
+        if current_tick() - self.missile_fire_tick < 5 {
+            let pos = self.target.position();
+            let vel = self.target.vel;
+            send([pos.x, pos.y, vel.x, vel.y]);
         }
 
-        kite(&self.target, 3500., 200.);
+        //let bullet_impact_time = projectile_impact_time2(&self.target, BULLET_SPEED);
+        //let aim_pos = rel_vel_target_pos(&self.target, bullet_impact_time);
+        let turn_torque = self
+            .aim
+            .aim_torque((self.target.position() - position()).angle() + rand(-0.1, 0.1));
+        torque(turn_torque);
+        //if angle_diff(heading(), (aim_pos - position()).angle()).abs() < 0.01 * TAU {
+        fire(0);
+        //}
+
+        kite(&self.target, 40000., 1000.);
 
         debug!("tracking {}", self.tracking);
-        draw_diamond(aim_pos, 5., 0xFFFF_0000);
-        draw_diamond(
-            self.target.position_in(bullet_impact_time),
-            10.,
-            0xFFFF_FF00,
-        );
+        //draw_diamond(aim_pos, 5., 0xFFFF_0000);
+        //draw_diamond(
+        //    self.target.position_in(bullet_impact_time),
+        //    10.,
+        //    0xFFFF_FF00,
+        //);
         draw_line(
             position(),
             position() + vec2(100_000., 0.).rotate(heading()),
@@ -88,7 +256,12 @@ fn kite(target: &TargetInfo, distance: f64, desired_side_speed: f64) {
     let towards_acc = target_dir * (desired_towards_speed - towards_speed);
     let side_acc = target_dir.rotate(0.25 * TAU) * (desired_side_speed - side_speed);
 
-    let acc = (towards_acc + side_acc) * max_forward_acceleration();
+    let towards_center_acc = if position().length() < 18_000. {
+        vec2(0., 0.)
+    } else {
+        -position() * 0.5
+    };
+    let acc = (towards_acc + side_acc + towards_center_acc) * max_forward_acceleration();
     accelerate(acc);
 }
 
@@ -98,7 +271,7 @@ struct RadarSearch {
     target_timeout: f64,
 }
 impl RadarSearch {
-    const FOV: f64 = 0.05 * TAU;
+    const FOV: f64 = 0.025 * TAU;
     const HEADING_STEP: f64 = 0.25 * TAU + 0.5 * Self::FOV;
 
     fn search(&mut self) {
@@ -109,19 +282,21 @@ impl RadarSearch {
         set_radar_max_distance(f64::MAX);
 
         if let Some(contact) = scan() {
-            if let Some(fuse_target) = self
-                .targets
-                .iter_mut()
-                .find(|t| t.position().distance(contact.position) < self.target_fuse_dist)
-            {
-                fuse_target.integrate_data(contact.position, contact.velocity, 1.);
-            } else {
-                self.targets.push(TargetInfo {
-                    pos: contact.position,
-                    vel: contact.velocity,
-                    acc: vec2(0., 0.),
-                    t: current_time(),
-                });
+            if contact.class != Class::Missile {
+                if let Some(fuse_target) = self
+                    .targets
+                    .iter_mut()
+                    .find(|t| t.position().distance(contact.position) < self.target_fuse_dist)
+                {
+                    fuse_target.integrate_data(contact.position, contact.velocity, 1.);
+                } else {
+                    self.targets.push(TargetInfo {
+                        pos: contact.position,
+                        vel: contact.velocity,
+                        acc: vec2(0., 0.),
+                        t: current_time(),
+                    });
+                }
             }
         }
 
@@ -153,8 +328,6 @@ impl RadarTrack {
 
         let distance = towards_target.length();
         let err = delta_time(self.last_contact_time) * self.err_per_sec;
-
-        debug!("err: {}, md: {}", err, distance + 100. + err);
 
         set_radar_max_distance(distance + 100. + err);
         set_radar_min_distance(distance - 100. - err);

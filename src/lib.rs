@@ -29,10 +29,8 @@ impl Ship {
 }
 
 pub struct Missile {
-    target: Option<TargetInfo>,
-    sweep: RadarSweep,
-    track: RadarTrack,
-    tracking: bool,
+    long_range_radar: LongRangeSearchAndTrack,
+    target_received: bool,
     closest_dist: f64,
 }
 impl Default for Missile {
@@ -47,42 +45,27 @@ impl Missile {
 
     pub fn new() -> Self {
         Self {
-            target: None,
-            sweep: RadarSweep {
-                max_angle: 0.06 * TAU,
-                min_fov: 0.001 * TAU,
-                max_fov: 0.0025 * TAU,
-                fov_step: 0.001 * TAU,
+            long_range_radar: LongRangeSearchAndTrack {
+                target: None,
+                target_lost_timeout: 60.,
+                last_contact_time: current_time(),
+                sweep_width_per_time: 0.01 * TAU,
+                sweep_direction: 1.,
             },
-            track: RadarTrack {
-                last_contact_time: 0.,
-                err_per_sec: 3000.,
-            },
-            tracking: true,
+            target_received: false,
             closest_dist: f64::MAX,
         }
     }
     pub fn tick(&mut self) {
-        let Some(target) = self.target.as_mut() else {
+        if !self.target_received {
             self.receive_target();
             return;
         };
-        target.debug();
-        if self.tracking {
-            let (contact, track_lost) = self.track.track(target.position());
-            self.tracking = !track_lost;
-            if let Some(contact) = contact {
-                if contact.class != Class::Missile {
-                    target.integrate_data(contact.position, contact.velocity, 0.75);
-                }
-            }
-        } else if let Some(contact) = self.sweep.sweep(target.position()) {
-            if contact.class != Class::Missile {
-                self.tracking = true;
-                self.track.last_contact_time = current_time();
-                target.integrate_data(contact.position, contact.velocity, 1.);
-            }
-        }
+        self.long_range_radar.tick();
+        let Some(target) = self.long_range_radar.target() else {
+            self.receive_target();
+            return;
+        };
 
         let tti = Self::time_to_impact(target);
         let impact_pos = target.position_in(tti);
@@ -93,11 +76,11 @@ impl Missile {
 
         if fuel() > 25. {
             let acc_power = fuel() / tti.abs();
-            if (0. ..=10.).contains(&tti) {
+            if (0. ..=10.).contains(&tti) || fuel() <= 800. {
                 let towards_impact = impact_pos - position();
                 let sideways_dir = towards_impact.normalize().rotate(0.25 * TAU);
                 let sideways_vel = velocity().dot(sideways_dir);
-                let sideways_factor = 1000. * towards_impact.length().recip();
+                let sideways_factor = 200. * towards_impact.length().recip();
                 let accel =
                     towards_impact.normalize() - sideways_dir * sideways_vel * sideways_factor;
                 turn(10. * angle_diff(heading(), accel.angle()));
@@ -113,7 +96,11 @@ impl Missile {
         self.trigger();
     }
     fn trigger(&mut self) {
-        let Some(distance) = self.target.map(|t| t.position().distance(position())) else {
+        let Some(distance) = self
+            .long_range_radar
+            .target()
+            .map(|t| t.position().distance(position()))
+        else {
             return;
         };
         if distance < Self::MIN_DISTANCE
@@ -133,7 +120,9 @@ impl Missile {
                 acc: vec2(0., 0.),
                 t: current_time(),
             };
-            self.target = Some(target);
+            self.long_range_radar.target = Some(target);
+            self.long_range_radar.last_contact_time = current_time();
+            self.target_received = true;
         }
     }
     fn time_to_impact(target: &TargetInfo) -> f64 {
@@ -156,10 +145,7 @@ impl Missile {
 }
 
 pub struct Fighter {
-    target: TargetInfo,
-    track: RadarTrack,
-    search: RadarSearch,
-    tracking: bool,
+    long_range_radar: LongRangeSearchAndTrack,
     aim: AimPid,
     missile_fire_tick: u32,
 }
@@ -173,48 +159,29 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            target: TargetInfo::default(),
-            track: RadarTrack {
-                last_contact_time: 0.,
-                err_per_sec: 2000.,
+            long_range_radar: LongRangeSearchAndTrack {
+                target: None,
+                target_lost_timeout: 2.5,
+                last_contact_time: current_time(),
+                sweep_width_per_time: 0.01 * TAU,
+                sweep_direction: 1.,
             },
-            search: RadarSearch {
-                targets: Vec::new(),
-                target_fuse_dist: 100.,
-                target_timeout: 0.25,
-            },
-            tracking: false,
             aim: AimPid::new(100., 0., -110_000.),
             missile_fire_tick: u32::MAX,
         }
     }
 
     pub fn tick(&mut self) {
-        self.target.debug();
-        if self.tracking {
-            let (contact, track_lost) = self.track.track(self.target.position());
-            if let Some(contact) = contact {
-                self.target
-                    .integrate_data(contact.position, contact.velocity, 0.75);
-            }
-            self.tracking = !track_lost;
-        } else {
-            self.search.search();
-            if let Some(target) = self.search.in_front_target() {
-                self.tracking = true;
-                self.track.last_contact_time = current_time();
-                self.target = *target;
-                self.aim.reset();
-            }
-        }
+        self.long_range_radar.tick();
+        let target = self.long_range_radar.target().copied().unwrap_or_default();
 
-        if reload_ticks(1) == 0 && self.tracking {
+        if reload_ticks(1) == 0 {
             fire(1);
             self.missile_fire_tick = current_tick();
         }
         if current_tick() - self.missile_fire_tick < 5 {
-            let pos = self.target.position();
-            let vel = self.target.vel;
+            let pos = target.position();
+            let vel = target.vel;
             send([pos.x, pos.y, vel.x, vel.y]);
         }
 
@@ -222,21 +189,14 @@ impl Fighter {
         //let aim_pos = rel_vel_target_pos(&self.target, bullet_impact_time);
         let turn_torque = self
             .aim
-            .aim_torque((self.target.position() - position()).angle() + rand(-0.05, 0.05));
+            .aim_torque((target.position() - position()).angle() + rand(-0.05, 0.05));
         torque(turn_torque);
         //if angle_diff(heading(), (aim_pos - position()).angle()).abs() < 0.01 * TAU {
         fire(0);
         //}
 
-        kite(&self.target, 40000., 1000.);
+        kite(&target, 40000., 1000.);
 
-        debug!("tracking {}", self.tracking);
-        //draw_diamond(aim_pos, 5., 0xFFFF_0000);
-        //draw_diamond(
-        //    self.target.position_in(bullet_impact_time),
-        //    10.,
-        //    0xFFFF_FF00,
-        //);
         draw_line(
             position(),
             position() + vec2(100_000., 0.).rotate(heading()),
@@ -254,7 +214,10 @@ fn kite(target: &TargetInfo, distance: f64, desired_side_speed: f64) {
     let desired_towards_speed = (target_dist - distance) / 10.;
 
     let towards_acc = target_dir * (desired_towards_speed - towards_speed);
-    let side_acc = target_dir.rotate(0.25 * TAU) * (desired_side_speed - side_speed);
+    let mut side_acc = target_dir.rotate(0.25 * TAU) * (desired_side_speed - side_speed);
+    if (current_tick() / 1000) % 2 == 1 {
+        side_acc *= -1.;
+    }
 
     let towards_center_acc = if position().length() < 19_000.
         && (position().length() < 15_000. || velocity().dot(position()) < 0.)
@@ -262,10 +225,72 @@ fn kite(target: &TargetInfo, distance: f64, desired_side_speed: f64) {
         vec2(0., 0.)
     } else {
         debug!("avoid death by cowardice");
-        -position() * 0.1
+        -position() * 0.25
     };
     let acc = (towards_acc + side_acc + towards_center_acc) * max_forward_acceleration();
     accelerate(acc);
+}
+
+struct LongRangeSearchAndTrack {
+    target: Option<TargetInfo>,
+    target_lost_timeout: f64,
+    last_contact_time: f64,
+    sweep_width_per_time: f64,
+    sweep_direction: f64,
+}
+
+impl LongRangeSearchAndTrack {
+    const SEARCH_FOV: f64 = 0.0035 * TAU;
+    const TRACK_FOV: f64 = 0.0001 * TAU;
+
+    fn target(&self) -> Option<&TargetInfo> {
+        self.target.as_ref()
+    }
+    fn search(&mut self) {
+        if let Some(contact) = scan() {
+            self.target
+                .get_or_insert_with(TargetInfo::default)
+                .integrate_data(contact.position, contact.velocity, 1.);
+            self.last_contact_time = current_time();
+            set_radar_width(Self::TRACK_FOV);
+            set_radar_heading(dir(position(), contact.position).angle());
+            return;
+        }
+        set_radar_width(Self::SEARCH_FOV);
+        set_radar_heading(radar_heading() + radar_width());
+    }
+    fn tick(&mut self) {
+        self.target.map(|t| t.debug(0xFFFF_FFFF));
+        if self.target.is_none() || delta_time(self.last_contact_time) > self.target_lost_timeout {
+            self.search();
+            return;
+        }
+        let target = self.target.as_mut().unwrap();
+
+        if let Some(contact) = scan() {
+            if contact.class != Class::Missile {
+                debug!("snr {}\nrssi {}", contact.snr, contact.rssi);
+                target.integrate_data(
+                    contact.position,
+                    contact.velocity,
+                    (contact.snr - 10.) / 20. + 5. * delta_time(self.last_contact_time),
+                );
+                self.last_contact_time = current_time();
+            }
+        }
+
+        let sweep_width = delta_time(self.last_contact_time) * self.sweep_width_per_time;
+        let target_heading = dir(position(), target.position()).angle();
+
+        if sweep_width < Self::TRACK_FOV {
+            set_radar_heading(target_heading);
+        } else if angle_diff(radar_heading(), target_heading).abs() > sweep_width {
+            set_radar_heading(target_heading - sweep_width);
+        } else {
+            set_radar_heading(radar_heading() + radar_width());
+        }
+        set_radar_width(Self::TRACK_FOV);
+    }
 }
 
 struct RadarSearch {
@@ -278,7 +303,7 @@ impl RadarSearch {
     const HEADING_STEP: f64 = 0.25 * TAU + 0.5 * Self::FOV;
 
     fn search(&mut self) {
-        self.targets.iter().for_each(TargetInfo::debug);
+        self.targets.iter().for_each(|t| t.debug(0xFFA0_A0A0));
         set_radar_width(Self::FOV);
         set_radar_heading(radar_heading() + Self::HEADING_STEP);
         set_radar_min_distance(0.);
@@ -386,16 +411,15 @@ struct TargetInfo {
 }
 
 impl TargetInfo {
-    fn debug(&self) {
-        draw_diamond(self.position(), 100., 0xFFFF_FFFF);
-        draw_triangle(self.pos, 100., 0xFFFF_FFFF);
-        draw_line(self.pos, self.pos + self.vel, 0xFFFF_FFFF);
-        draw_line(self.pos, self.pos + self.acc, 0xFFC8_6400);
-        draw_text!(self.pos, 0xFF64_6464, "{}", delta_time(self.t));
+    fn debug(&self, color: u32) {
+        draw_diamond(self.position(), 100., color);
+        draw_triangle(self.pos, 100., color);
+        draw_line(self.pos, self.pos + self.vel, color);
+        draw_text!(self.pos, color, "{}", delta_time(self.t));
     }
 
     fn integrate_data(&mut self, position: Vec2, velocity: Vec2, importance: f64) {
-        assert!((0. ..=1.).contains(&importance));
+        let importance = importance.clamp(0.001, 1.);
         let p_importance = importance;
         let v_importance = 0.75 * p_importance;
         let a_importance = 0.75 * v_importance;

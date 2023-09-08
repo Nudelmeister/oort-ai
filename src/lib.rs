@@ -57,8 +57,8 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            radar: UnifiedRadar::new(1., 0.0..=40_000., 0., TAU, TAU * TICK_LENGTH * 2., None),
-            aimbot: AimBot::new(50., -100_000.),
+            radar: UnifiedRadar::new(1., 0.0..=40_000., 0., TAU, TAU * TICK_LENGTH, None),
+            aimbot: AimBot::new(200., -100_000.),
         }
     }
 
@@ -79,11 +79,16 @@ impl Fighter {
             self.radar.scan_direction = 0.;
             self.radar.scan_angle_max = TAU;
         }
-        for f in fighters {
+        for f in fighters.iter().take(1) {
             self.radar.start_tracking(f.id);
             self.radar.scan_distance_range = 0.0..=f.distance() - 100.;
             self.radar.scan_direction = f.direction().angle();
             self.radar.scan_angle_max = 0.125 * TAU;
+            //let lead_pos = f.position_in(f.projectile_impact_time(BULLET_SPEED));
+            //draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
+            //let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
+            //torque(aim_torque);
+            //fire(0);
         }
         if let Some((missile, impact_time)) = missiles
             .iter()
@@ -93,15 +98,28 @@ impl Fighter {
                 (intersept_pos.distance(position_in(intercept_time)) < 200.)
                     .then_some((m, intercept_time))
             })
+            .filter(|(_, t)| t.is_sign_positive())
             .min_by_key(|(_, t)| (t * 1000.) as i64)
         {
             debug!("{}, d: {}", missile.id, impact_time);
-            let lead_pos = missile.position_in(missile.projectile_impact_time(BULLET_SPEED));
+            let projectile_time = missile.projectile_impact_time(BULLET_SPEED);
+            let lead_pos = missile.position_in(projectile_time) - velocity() * projectile_time;
             draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
-            let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
+            let aim_torque =
+                self.aimbot.aim_torque((lead_pos - position()).angle()) + rand(-25., 25.);
             torque(aim_torque);
-            fire(0);
-            // TODO: shoot missile down
+            if angle_diff(heading(), (lead_pos - position()).angle()).abs() < 0.005 * TAU {
+                fire(0);
+            }
+        } else {
+            let aim_torque = self.aimbot.aim_torque(
+                self.radar
+                    .fighters()
+                    .next()
+                    .map(|f| f.heading())
+                    .unwrap_or(heading()),
+            );
+            torque(aim_torque);
         }
 
         for m in missiles {
@@ -109,7 +127,7 @@ impl Fighter {
                 self.radar.start_tracking(m.id);
             }
         }
-        accelerate(vec2(1., -1.) * 10.);
+        accelerate(-position() * 0.001);
     }
 }
 
@@ -172,13 +190,30 @@ impl RadarContact {
         closest_time
     }
     fn projectile_impact_time(&self, projectile_speed: f64) -> f64 {
-        let mut time = 0.;
-        for _ in 0..10 {
-            debug!("{time:.3}");
-            let c_pos_rel = self.position_in(time) - velocity() * time;
-            time = 0.9 * time + 0.1 * c_pos_rel.distance(position()) / projectile_speed;
+        let dir = self.direction();
+        let time =
+            self.distance() / (projectile_speed + velocity().dot(dir) + self.velocity.dot(-dir));
+
+        let mut closest_dist = (self.position_in(time) - velocity() * time).distance(
+            position()
+                + ((self.position_in(time) - velocity() * time) - position()).normalize()
+                    * projectile_speed,
+        );
+        let mut closest_time = time;
+
+        for i in -10..=10 {
+            let t = time + time * i as f64 / 20.;
+            let dist = (self.position_in(t) - velocity() * t).distance(
+                position()
+                    + ((self.position_in(t) - velocity() * t) - position()).normalize()
+                        * projectile_speed,
+            );
+            if dist < closest_dist {
+                closest_time = t;
+                closest_dist = dist;
+            }
         }
-        time
+        closest_time
     }
 
     fn position(&self) -> Vec2 {
@@ -186,7 +221,7 @@ impl RadarContact {
     }
     fn position_in(&self, time: f64) -> Vec2 {
         let elapsed = elapsed(self.time) + time;
-        self.position + self.velocity * elapsed + self.acceleration * elapsed.powi(2) * 0.5 * 0.25
+        self.position + self.velocity * elapsed + self.acceleration * elapsed.powi(2) * 0.5
     }
 
     fn distance(&self) -> f64 {
@@ -289,16 +324,32 @@ impl UnifiedRadar {
             set_radar_width(Self::TWS_TRACK_FOV * radial_zoom);
             set_radar_heading(c.heading());
         } else {
-            set_radar_min_distance(*self.scan_distance_range.start());
-            set_radar_max_distance(*self.scan_distance_range.end());
             set_radar_width(self.scan_fov);
             self.scan_heading += self.scan_fov;
             if angle_diff(self.scan_heading, self.scan_direction).abs() > self.scan_angle_max {
                 self.scan_heading = self.scan_direction - self.scan_angle_max;
             }
             set_radar_heading(self.scan_heading);
+            if let Some(same_heading_track_dist) = self
+                .tracking
+                .iter()
+                .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
+                .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
+                .map(|tc| tc.distance())
+                .min_by_key(|d| (d * 1000.) as i64)
+            {
+                set_radar_max_distance(
+                    self.scan_distance_range
+                        .end()
+                        .min(same_heading_track_dist - 100.),
+                );
+            } else {
+                set_radar_max_distance(*self.scan_distance_range.end());
+            }
+            set_radar_min_distance(*self.scan_distance_range.start());
         }
         self.evict_contacts();
+        self.merge_contacts();
     }
 
     fn integrate_contact(&mut self, contact: &ScanResult) {
@@ -323,6 +374,47 @@ impl UnifiedRadar {
                 acceleration: Vec2::zero(),
             });
             self.next_id += 1;
+        }
+    }
+
+    fn merge_contacts(&mut self) {
+        for (a_idx, a) in self.contacts.iter().enumerate() {
+            for (b_idx, b) in self.contacts.iter().enumerate() {
+                if a_idx == b_idx || a.id == b.id || a.class != b.class {
+                    continue;
+                }
+                if a.position().distance(b.position())
+                    < ((a.position() + b.position()) * 0.5).distance(position())
+                        * 0.001
+                        * Self::CONTACT_FUSE_DIST_PER_KM
+                {
+                    let a = *a;
+                    let merged = RadarContact {
+                        id: a.id,
+                        class: a.class,
+                        time: (a.time + b.time) * 0.5,
+                        position: (a.position + b.position) * 0.5,
+                        velocity: (a.velocity + b.velocity) * 0.5,
+                        acceleration: (a.acceleration + b.acceleration) * 0.5,
+                    };
+                    let tracking_a = self.tracking.iter().any(|id| *id == a.id);
+                    if let Some((idx, _)) = self
+                        .tracking
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, id)| **id == b.id)
+                    {
+                        if tracking_a {
+                            self.tracking.remove(idx);
+                        } else {
+                            self.tracking[idx] = a.id;
+                        }
+                    }
+                    self.contacts[a_idx] = merged;
+                    self.contacts.swap_remove(b_idx);
+                    return;
+                }
+            }
         }
     }
 

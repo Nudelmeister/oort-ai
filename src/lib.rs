@@ -1,5 +1,12 @@
-use oort_api::prelude::{maths_rs::prelude::Base, *};
-use std::ops::RangeInclusive;
+use oort_api::prelude::{
+    byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt},
+    maths_rs::{prelude::Base, Vec2f},
+    *,
+};
+use std::{
+    io::Cursor,
+    ops::{ControlFlow, RangeInclusive},
+};
 
 const BULLET_SPEED: f64 = 1000.0; // m/s
 
@@ -29,7 +36,13 @@ impl Ship {
     }
 }
 
-pub struct Missile {}
+pub struct Missile {
+    id: Option<u16>,
+    radar: UnifiedRadar,
+    paired: Option<u16>,
+    paired_tti: Option<f64>,
+    explode_dist: f64,
+}
 impl Default for Missile {
     fn default() -> Self {
         Self::new()
@@ -38,15 +51,412 @@ impl Default for Missile {
 
 impl Missile {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            id: None,
+            radar: UnifiedRadar::new(
+                20.,
+                0.0..=f64::MAX,
+                0.,
+                TAU,
+                TAU * TICK_LENGTH / 10.,
+                Some(Box::new(|c| c.class == Class::Fighter && c.snr > 10.)),
+            ),
+            paired: None,
+            paired_tti: None,
+            explode_dist: 50.,
+        }
     }
-    pub fn tick(&mut self) {}
+
+    pub fn receive(&mut self) {
+        if let Some(message) = receive_bytes().and_then(Message::from_bytes) {
+            match message {
+                Message::MissileInit(msg) => self.receive_missile_init(msg),
+                Message::TargetUpdate(msg) => self.receive_target_update(msg),
+                Message::PotentialTarget(msg) => self.receive_potential_target(msg),
+                Message::Pair(msg) => self.receive_pair(msg),
+                Message::PairTti(msg) => self.receive_pair_tti(msg),
+            }
+        }
+    }
+
+    fn receive_pair(&mut self, msg: Pair) {
+        let Some(my_id) = self.id else {
+            return;
+        };
+        if self.paired.is_some() {
+            return;
+        }
+        if msg.missile_id_a == my_id {
+            self.paired = Some(msg.missile_id_b);
+        } else if msg.missile_id_b == my_id {
+            self.paired = Some(msg.missile_id_a);
+        }
+    }
+    fn receive_pair_tti(&mut self, msg: PairTti) {
+        let Some(paired_id) = self.paired else {
+            return;
+        };
+        if msg.sender_missile_id == paired_id {
+            self.paired_tti = Some(msg.time_to_impact.into());
+        }
+    }
+
+    fn receive_potential_target(&mut self, msg: TargetUpdate) {
+        if msg
+            .missile_id
+            .get()
+            .zip(self.id)
+            .map_or(true, |(m_id, s_id)| m_id == s_id)
+        {
+            if self.paired.is_some() {
+                return;
+            }
+            let c = RadarContact {
+                id: 0,
+                class: msg.target.class,
+                time: current_time() - TICK_LENGTH,
+                position: msg.target.pos.into(),
+                velocity: msg.target.vel.into(),
+                acceleration: Vec2::zero(),
+            };
+            let intercept_time = c.closest_intercept_time();
+            if intercept_time < 0. {
+                return;
+            }
+            if c.position_in(intercept_time)
+                .distance(position_in(intercept_time))
+                > 100.
+            {
+                return;
+            }
+            self.radar.filter = Some(Box::new(move |x| x.class == c.class));
+            self.radar.contacts.clear();
+            self.radar.tracking.clear();
+            let contact_id = self.radar.add_contact(
+                msg.target.pos.into(),
+                msg.target.vel.into(),
+                msg.target.class,
+            );
+            self.radar.start_tracking(contact_id);
+            self.radar.contact_timeout = 0.5;
+            self.explode_dist = 25.;
+        }
+    }
+
+    fn receive_target_update(&mut self, msg: TargetUpdate) {
+        if msg
+            .missile_id
+            .get()
+            .zip(self.id)
+            .map_or(true, |(m_id, s_id)| m_id == s_id)
+        {
+            if self
+                .radar
+                .contacts
+                .get(0)
+                .map_or(false, |c| msg.target.class != c.class)
+            {
+                return;
+            }
+            self.radar.contacts.clear();
+            self.radar.tracking.clear();
+            let contact_id = self.radar.add_contact(
+                msg.target.pos.into(),
+                msg.target.vel.into(),
+                msg.target.class,
+            );
+            self.radar.start_tracking(contact_id);
+            self.radar.filter = Some(Box::new(move |x| x.class == msg.target.class));
+            self.explode_dist = 100.;
+        }
+    }
+
+    fn receive_missile_init(&mut self, msg: MissileInit) {
+        if self.id.is_none() {
+            debug!("Missile Initialized");
+            self.id = Some(msg.missile_id);
+            self.radar.contacts.clear();
+            self.radar.tracking.clear();
+            let contact_id = self.radar.add_contact(
+                msg.target.pos.into(),
+                msg.target.vel.into(),
+                msg.target.class,
+            );
+            self.radar.start_tracking(contact_id);
+        }
+    }
+
+    fn send(&mut self) {
+        let Some((my_id, _)) = self.id.zip(self.paired) else {
+            return;
+        };
+        let Some(contact) = self.radar.contacts.get(0).copied() else {
+            return;
+        };
+
+        if rand(0., 30.) < 1. {
+            let message = Message::PairTti(PairTti {
+                sender_missile_id: my_id,
+                time_to_impact: contact.closest_intercept_time() as f32,
+            });
+            send_bytes(&message.to_bytes());
+            draw_triangle(position(), 1000., 0xFFA0_A0FF);
+        }
+    }
+
+    fn tick(&mut self) {
+        const SIDE_BUDGET: f64 = 1200.;
+        self.receive();
+        self.send();
+        self.radar.tick();
+
+        let Some(contact) = self.radar.contacts.get(0).copied() else {
+            return;
+        };
+        if self.radar.contacts.len() == 1 {
+            self.radar.start_tracking(contact.id);
+        }
+        contact.debug();
+        self.radar.scan_direction = contact.heading();
+        self.radar.scan_angle_max = 0.05 * TAU;
+
+        let towards_dir = contact.direction();
+        let side_dir = towards_dir.rotate(0.25 * TAU);
+        let side_speed = velocity().dot(side_dir)
+            - (contact.distance().recip() * 5000.).clamp(0., 1.) * contact.velocity.dot(side_dir);
+
+        let impact_time = contact.closest_intercept_time();
+        let impact_time_correction = self
+            .paired_tti
+            .map(|p_tti| (p_tti + impact_time) * 0.5)
+            .map(|desired_tti| impact_time - desired_tti)
+            .unwrap_or(0.);
+        draw_diamond(contact.position_in(impact_time), 150., 0xFFFF_0000);
+        debug!("Boom in {:.3}s", impact_time);
+        if let Some(p_tti) = self.paired_tti {
+            debug!(
+                "Partner Boom in {:.3}s, delta: {:.3}",
+                p_tti, impact_time_correction
+            );
+        }
+        if health() < 20.
+            || impact_time.abs() <= TICK_LENGTH
+            || contact.distance() < self.explode_dist
+        {
+            explode();
+        }
+
+        if impact_time.is_sign_negative() || (impact_time > 25.) {
+            draw_square(contact.position_in(10.), 200., 0xFFA0_A0A0);
+            accelerate(contact.position_in(10.) - position());
+            turn(10. * angle_diff(heading(), (contact.position_in(10.) - position()).angle()));
+            return;
+        }
+        let towards_correction_acc = towards_dir * 10. * impact_time_correction
+            + towards_dir * (fuel() - SIDE_BUDGET).max(0.);
+        let side_correction_acc = side_dir * -side_speed;
+
+        let mut acc = towards_correction_acc + side_correction_acc;
+        acc *= fuel() / (impact_time * acc.length());
+
+        turn(angle_diff(heading(), acc.angle()) * 10.);
+
+        if fuel() > 10. {
+            accelerate(acc);
+        } else {
+            accelerate(Vec2::zero());
+        }
+    }
+}
+
+enum Message {
+    MissileInit(MissileInit),
+    TargetUpdate(TargetUpdate),
+    PotentialTarget(TargetUpdate),
+    Pair(Pair),
+    PairTti(PairTti),
+}
+impl Message {
+    fn from_bytes(data: [u8; 32]) -> Option<Self> {
+        let mut cursor = Cursor::new(data);
+        let discriminant = cursor.read_u8().ok()?;
+        match discriminant {
+            0 => Some(Self::MissileInit(MissileInit::from_bytes(&mut cursor)?)),
+            1 => Some(Self::TargetUpdate(TargetUpdate::from_bytes(&mut cursor)?)),
+            2 => Some(Self::PotentialTarget(TargetUpdate::from_bytes(
+                &mut cursor,
+            )?)),
+            3 => Some(Self::Pair(Pair::from_bytes(&mut cursor)?)),
+            4 => Some(Self::PairTti(PairTti::from_bytes(&mut cursor)?)),
+            _ => None,
+        }
+    }
+    fn to_bytes(self) -> [u8; 32] {
+        let mut data = [0; 32];
+        let mut cursor = Cursor::new(data.as_mut_slice());
+        match self {
+            Message::MissileInit(msg) => {
+                let _ = cursor.write_u8(0);
+                msg.to_bytes(&mut cursor);
+            }
+            Message::TargetUpdate(msg) => {
+                let _ = cursor.write_u8(1);
+                msg.to_bytes(&mut cursor);
+            }
+            Message::PotentialTarget(msg) => {
+                let _ = cursor.write_u8(2);
+                msg.to_bytes(&mut cursor);
+            }
+            Message::Pair(msg) => {
+                let _ = cursor.write_u8(3);
+                msg.to_bytes(&mut cursor);
+            }
+            Message::PairTti(msg) => {
+                let _ = cursor.write_u8(4);
+                msg.to_bytes(&mut cursor);
+            }
+        };
+
+        data
+    }
+}
+
+struct PackedOptionU16(u16);
+impl PackedOptionU16 {
+    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+        Some(Self(data.read_u16::<NetworkEndian>().ok()?))
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        let _ = data.write_u16::<NetworkEndian>(self.0);
+    }
+    fn get(self) -> Option<u16> {
+        (self.0 != u16::MAX).then_some(self.0)
+    }
+    fn make(value: Option<u16>) -> Self {
+        Self(value.unwrap_or(u16::MAX))
+    }
+}
+struct PairTti {
+    sender_missile_id: u16,
+    time_to_impact: f32,
+}
+impl PairTti {
+    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+        let sender_missile_id = data.read_u16::<NetworkEndian>().ok()?;
+        let time_to_impact = data.read_f32::<NetworkEndian>().ok()?;
+        Some(Self {
+            sender_missile_id,
+            time_to_impact,
+        })
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        let _ = data.write_u16::<NetworkEndian>(self.sender_missile_id);
+        let _ = data.write_f32::<NetworkEndian>(self.time_to_impact);
+    }
+}
+
+struct Pair {
+    missile_id_a: u16,
+    missile_id_b: u16,
+}
+impl Pair {
+    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+        let missile_id_a = data.read_u16::<NetworkEndian>().ok()?;
+        let missile_id_b = data.read_u16::<NetworkEndian>().ok()?;
+        Some(Self {
+            missile_id_a,
+            missile_id_b,
+        })
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        let _ = data.write_u16::<NetworkEndian>(self.missile_id_a);
+        let _ = data.write_u16::<NetworkEndian>(self.missile_id_b);
+    }
+}
+
+struct MissileInit {
+    missile_id: u16,
+    target: TargetMsg,
+}
+impl MissileInit {
+    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+        let missile_id = data.read_u16::<NetworkEndian>().ok()?;
+        let target = TargetMsg::from_bytes(data)?;
+        Some(Self { missile_id, target })
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        let _ = data.write_u16::<NetworkEndian>(self.missile_id);
+        self.target.to_bytes(data);
+    }
+}
+struct TargetUpdate {
+    missile_id: PackedOptionU16,
+    target: TargetMsg,
+}
+impl TargetUpdate {
+    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+        let missile_id = PackedOptionU16::from_bytes(data)?;
+        let target = TargetMsg::from_bytes(data)?;
+        Some(Self { missile_id, target })
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        self.missile_id.to_bytes(data);
+        self.target.to_bytes(data);
+    }
+}
+
+struct TargetMsg {
+    class: Class,
+    pos: Vec2f,
+    vel: Vec2f,
+}
+impl TargetMsg {
+    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+        let class = match data.read_u8().ok()? {
+            0 => Class::Fighter,
+            1 => Class::Frigate,
+            2 => Class::Cruiser,
+            3 => Class::Asteroid,
+            4 => Class::Target,
+            5 => Class::Missile,
+            6 => Class::Torpedo,
+            7 => Class::Unknown,
+            _ => return None,
+        };
+        let px = data.read_f32::<NetworkEndian>().ok()?;
+        let py = data.read_f32::<NetworkEndian>().ok()?;
+        let vx = data.read_f32::<NetworkEndian>().ok()?;
+        let vy = data.read_f32::<NetworkEndian>().ok()?;
+
+        Some(Self {
+            class,
+            pos: Vec2f::new(px, py),
+            vel: Vec2f::new(vx, vy),
+        })
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        let _ = data.write_u8(match self.class {
+            Class::Fighter => 0,
+            Class::Frigate => 1,
+            Class::Cruiser => 2,
+            Class::Asteroid => 3,
+            Class::Target => 4,
+            Class::Missile => 5,
+            Class::Torpedo => 6,
+            Class::Unknown => 7,
+        });
+        let _ = data.write_f32::<NetworkEndian>(self.pos.x);
+        let _ = data.write_f32::<NetworkEndian>(self.pos.y);
+        let _ = data.write_f32::<NetworkEndian>(self.vel.x);
+        let _ = data.write_f32::<NetworkEndian>(self.vel.y);
+    }
 }
 
 pub struct Fighter {
     radar: UnifiedRadar,
     aimbot: AimBot,
     aim_id: u32,
+    next_missile_id: u16,
 }
 
 impl Default for Fighter {
@@ -58,9 +468,17 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            radar: UnifiedRadar::new(0.5, 0.0..=40_000., 0., TAU, TAU * TICK_LENGTH, None),
+            radar: UnifiedRadar::new(
+                0.5,
+                0.0..=40_000.,
+                0.,
+                TAU,
+                TAU * TICK_LENGTH / 2.,
+                Some(Box::new(|c| c.snr > 10.)),
+            ),
             aimbot: AimBot::new(120., -120_000.),
             aim_id: 0,
+            next_missile_id: 0,
         }
     }
 
@@ -77,26 +495,69 @@ impl Fighter {
         let fighters = self.radar.fighters().copied().collect::<Vec<_>>();
         let missiles = self.radar.missiles().copied().collect::<Vec<_>>();
         if fighters.is_empty() {
-            self.radar.scan_distance_range = 0.0..=f64::MAX;
             self.radar.scan_direction = 0.;
             self.radar.scan_angle_max = TAU;
+            self.radar.scan_fov = TAU * TICK_LENGTH / 2.;
         }
         for f in fighters.iter().take(1) {
             self.radar.start_tracking(f.id);
-            self.radar.scan_distance_range = 0.0..=f.distance() - 100.;
             self.radar.scan_direction = f.direction().angle();
+            self.radar.scan_fov = TAU * TICK_LENGTH * 2.;
             self.radar.scan_angle_max = 0.125 * TAU;
             //let lead_pos = f.position_in(f.projectile_impact_time(BULLET_SPEED));
             //draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
             //let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
             //torque(aim_torque);
             //fire(0);
-            accelerate(
-                (f.direction() * 0.5
-                    + (f.position_in(f.closest_intercept_time()) - position()).normalize() * 0.5)
-                    * max_forward_acceleration()
-                    * 0.1,
-            );
+            //accelerate(
+            //    (f.direction() * 0.5
+            //        + (f.position_in(f.closest_intercept_time()) - position()).normalize() * 0.5)
+            //        * max_forward_acceleration()
+            //        * 0.1,
+            //);
+
+            if reload_ticks(1) == 0 {
+                fire(1);
+                let message = Message::MissileInit(MissileInit {
+                    missile_id: self.next_missile_id,
+                    target: TargetMsg {
+                        class: Class::Fighter,
+                        pos: f.position.into(),
+                        vel: f.velocity.into(),
+                    },
+                });
+                send_bytes(&message.to_bytes());
+                self.next_missile_id += 1;
+            } else if current_tick() % 60 == 0 {
+                let message = Message::TargetUpdate(TargetUpdate {
+                    missile_id: PackedOptionU16::make(None),
+                    target: TargetMsg {
+                        class: Class::Fighter,
+                        pos: f.position.into(),
+                        vel: f.velocity.into(),
+                    },
+                });
+                send_bytes(&message.to_bytes());
+            } else if !missiles.is_empty() {
+                let idx = current_tick() % missiles.len() as u32;
+                let m = missiles[idx as usize];
+                let message = Message::PotentialTarget(TargetUpdate {
+                    missile_id: PackedOptionU16::make(None),
+                    target: TargetMsg {
+                        class: Class::Missile,
+                        pos: m.position().into(),
+                        vel: m.velocity.into(),
+                    },
+                });
+                send_bytes(&message.to_bytes());
+            } else if current_tick() % 25 == 0 && self.next_missile_id >= 2 {
+                let message = Message::Pair(Pair {
+                    missile_id_a: self.next_missile_id - 1,
+                    missile_id_b: self.next_missile_id - 2,
+                });
+                send_bytes(&message.to_bytes());
+                draw_triangle(position(), 1000., 0xFFA0_A0FF);
+            }
         }
         if let Some((missile, impact_time)) = missiles
             .iter()
@@ -136,6 +597,8 @@ impl Fighter {
                 self.radar.start_tracking(m.id);
             }
         }
+
+        accelerate(vec2(0., -position().y));
     }
 }
 
@@ -180,30 +643,14 @@ impl RadarContact {
 
     /// (+- dist, width)
     fn radar_track_radius(&self) -> (f64, f64) {
-        let dist_range = self.velocity.length() * TICK_LENGTH;
+        let dist_range = 10. * self.velocity.length() * TICK_LENGTH;
         let circumference = self.distance() * TAU;
         let x = dist_range / circumference;
         (dist_range, x)
     }
 
     fn closest_intercept_time(&self) -> f64 {
-        let dir = self.direction();
-        let closing_speed = velocity().dot(dir) + self.velocity.dot(-dir);
-
-        let time = self.distance() / closing_speed;
-        let mut closest_dist = self.position_in(time).distance(position_in(time));
-        let mut closest_time = time;
-
-        for i in -10..=10 {
-            let t = time + time * i as f64 / 100.;
-            let dist = self.position_in(time).distance(position_in(time));
-            if dist < closest_dist {
-                closest_time = t;
-                closest_dist = dist;
-            }
-        }
-
-        closest_time
+        self.projectile_impact_time(0.)
     }
 
     fn projectile_lead_heading(&self, projectile_speed: f64) -> f64 {
@@ -231,8 +678,6 @@ impl RadarContact {
                 position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
             let dist = rel_vel_pos.distance(bullet_pos);
             if dist < closest_dist {
-                draw_square(rel_vel_pos, 100., 0xFFFF_FFFF);
-                draw_square(bullet_pos, 100., 0xFFFF_FF00);
                 closest_time = t;
                 closest_dist = dist;
             }
@@ -245,8 +690,6 @@ impl RadarContact {
                 position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
             let dist = rel_vel_pos.distance(bullet_pos);
             if dist < closest_dist {
-                draw_square(rel_vel_pos, 100., 0xFFFF_FFFF);
-                draw_square(bullet_pos, 100., 0xFFFF_FF00);
                 closest_time = t;
                 closest_dist = dist;
             }
@@ -259,8 +702,6 @@ impl RadarContact {
                 position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
             let dist = rel_vel_pos.distance(bullet_pos);
             if dist < closest_dist {
-                draw_square(rel_vel_pos, 100., 0xFFFF_FFFF);
-                draw_square(bullet_pos, 100., 0xFFFF_FF00);
                 closest_time = t;
                 closest_dist = dist;
             }
@@ -318,7 +759,7 @@ struct UnifiedRadar {
 impl UnifiedRadar {
     const TWS_TRACK_FOV: f64 = 0.001 * TAU;
     const TWS_TRACK_DIST_RANGE: f64 = 100.;
-    const TWS_TRACK_LOST_ZOOM_FACTOR: f64 = 5000.;
+    const TWS_TRACK_LOST_ZOOM_FACTOR: f64 = 2500.;
     const CONTACT_FUSE_DIST_PER_KM: f64 = 200.;
 
     fn new(
@@ -483,6 +924,20 @@ impl UnifiedRadar {
     }
     fn missiles(&self) -> impl Iterator<Item = &RadarContact> {
         self.contacts.iter().filter(|c| c.class == Class::Missile)
+    }
+
+    fn add_contact(&mut self, pos: Vec2, vel: Vec2, class: Class) -> u32 {
+        let contact = RadarContact {
+            id: self.next_id,
+            class,
+            time: current_time(),
+            position: pos,
+            velocity: vel,
+            acceleration: Vec2::zero(),
+        };
+        self.contacts.push(contact);
+        self.next_id += 1;
+        self.next_id - 1
     }
 }
 

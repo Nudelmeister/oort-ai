@@ -59,7 +59,7 @@ impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
             radar: UnifiedRadar::new(0.5, 0.0..=40_000., 0., TAU, TAU * TICK_LENGTH, None),
-            aimbot: AimBot::new(100., -100_000.),
+            aimbot: AimBot::new(120., -120_000.),
             aim_id: 0,
         }
     }
@@ -91,6 +91,12 @@ impl Fighter {
             //let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
             //torque(aim_torque);
             //fire(0);
+            accelerate(
+                (f.direction() * 0.5
+                    + (f.position_in(f.closest_intercept_time()) - position()).normalize() * 0.5)
+                    * max_forward_acceleration()
+                    * 0.1,
+            );
         }
         if let Some((missile, impact_time)) = missiles
             .iter()
@@ -103,29 +109,26 @@ impl Fighter {
             .filter(|(_, t)| t.is_sign_positive())
             .min_by_key(|(_, t)| (t * 1000.) as i64)
         {
-            debug!("{}, d: {}", missile.id, impact_time);
-            let projectile_time = missile.projectile_impact_time(BULLET_SPEED);
-            let lead_pos = missile.position_in(projectile_time) - velocity() * projectile_time;
-            draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
             if self.aim_id != missile.id {
                 self.aimbot.reset();
             }
             self.aim_id = missile.id;
-            let aim_torque =
-                self.aimbot.aim_torque((lead_pos - position()).angle()) + rand(-25., 25.);
-            torque(aim_torque);
-            if angle_diff(heading(), (lead_pos - position()).angle()).abs() < 0.005 * TAU {
+            debug!("{}, d: {}", missile.id, impact_time);
+            let lead_heading = missile.projectile_lead_heading(BULLET_SPEED);
+            torque(self.aimbot.aim_torque(lead_heading) + rand(-20., 20.));
+            if angle_diff(heading(), lead_heading).abs() < 0.01 * TAU {
                 fire(0);
             }
         } else {
-            //let aim_torque = self.aimbot.aim_torque(
-            //    self.radar
-            //        .fighters()
-            //        .next()
-            //        .map(|f| f.heading())
-            //        .unwrap_or(heading()),
-            //);
-            //torque(aim_torque);
+            let aim_torque = self.aimbot.aim_torque(
+                self.radar
+                    .fighters()
+                    .next()
+                    .map(|f| f.projectile_lead_heading(BULLET_SPEED))
+                    .unwrap_or(heading()),
+            );
+            torque(aim_torque);
+            fire(0);
         }
 
         for m in missiles {
@@ -133,7 +136,6 @@ impl Fighter {
                 self.radar.start_tracking(m.id);
             }
         }
-        accelerate(-position() * 0.001);
     }
 }
 
@@ -193,7 +195,7 @@ impl RadarContact {
         let mut closest_time = time;
 
         for i in -10..=10 {
-            let t = time + time * i as f64 / 20.;
+            let t = time + time * i as f64 / 100.;
             let dist = self.position_in(time).distance(position_in(time));
             if dist < closest_dist {
                 closest_time = t;
@@ -203,6 +205,12 @@ impl RadarContact {
 
         closest_time
     }
+
+    fn projectile_lead_heading(&self, projectile_speed: f64) -> f64 {
+        let t = self.projectile_impact_time(projectile_speed);
+        ((self.position_in(t) - velocity() * t) - position()).angle()
+    }
+
     fn projectile_impact_time(&self, projectile_speed: f64) -> f64 {
         let dir = self.direction();
         let time =
@@ -216,15 +224,43 @@ impl RadarContact {
         );
         let mut closest_time = time;
 
-        for i in -10..=10 {
-            let t = time + time * (i as f64 / 200.);
+        for i in -1..=10 {
+            let t = time + time * i as f64 / 5.;
             let rel_vel_pos = self.position_in(t) - velocity() * t;
             let bullet_pos =
                 position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
             let dist = rel_vel_pos.distance(bullet_pos);
             if dist < closest_dist {
-                draw_square(rel_vel_pos, 200., 0xFFFF_FFFF);
-                draw_square(bullet_pos, 200., 0xFFFF_FF00);
+                draw_square(rel_vel_pos, 100., 0xFFFF_FFFF);
+                draw_square(bullet_pos, 100., 0xFFFF_FF00);
+                closest_time = t;
+                closest_dist = dist;
+            }
+        }
+        let time = closest_time;
+        for i in -5..=5 {
+            let t = time + time * i as f64 / 50.;
+            let rel_vel_pos = self.position_in(t) - velocity() * t;
+            let bullet_pos =
+                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
+            let dist = rel_vel_pos.distance(bullet_pos);
+            if dist < closest_dist {
+                draw_square(rel_vel_pos, 100., 0xFFFF_FFFF);
+                draw_square(bullet_pos, 100., 0xFFFF_FF00);
+                closest_time = t;
+                closest_dist = dist;
+            }
+        }
+        let time = closest_time;
+        for i in -5..=5 {
+            let t = time + time * i as f64 / 500.;
+            let rel_vel_pos = self.position_in(t) - velocity() * t;
+            let bullet_pos =
+                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
+            let dist = rel_vel_pos.distance(bullet_pos);
+            if dist < closest_dist {
+                draw_square(rel_vel_pos, 100., 0xFFFF_FFFF);
+                draw_square(bullet_pos, 100., 0xFFFF_FF00);
                 closest_time = t;
                 closest_dist = dist;
             }

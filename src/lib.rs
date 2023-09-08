@@ -46,6 +46,7 @@ impl Missile {
 pub struct Fighter {
     radar: UnifiedRadar,
     aimbot: AimBot,
+    aim_id: u32,
 }
 
 impl Default for Fighter {
@@ -57,8 +58,9 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            radar: UnifiedRadar::new(1., 0.0..=40_000., 0., TAU, TAU * TICK_LENGTH, None),
-            aimbot: AimBot::new(200., -100_000.),
+            radar: UnifiedRadar::new(0.5, 0.0..=40_000., 0., TAU, TAU * TICK_LENGTH, None),
+            aimbot: AimBot::new(100., -100_000.),
+            aim_id: 0,
         }
     }
 
@@ -105,6 +107,10 @@ impl Fighter {
             let projectile_time = missile.projectile_impact_time(BULLET_SPEED);
             let lead_pos = missile.position_in(projectile_time) - velocity() * projectile_time;
             draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
+            if self.aim_id != missile.id {
+                self.aimbot.reset();
+            }
+            self.aim_id = missile.id;
             let aim_torque =
                 self.aimbot.aim_torque((lead_pos - position()).angle()) + rand(-25., 25.);
             torque(aim_torque);
@@ -112,14 +118,14 @@ impl Fighter {
                 fire(0);
             }
         } else {
-            let aim_torque = self.aimbot.aim_torque(
-                self.radar
-                    .fighters()
-                    .next()
-                    .map(|f| f.heading())
-                    .unwrap_or(heading()),
-            );
-            torque(aim_torque);
+            //let aim_torque = self.aimbot.aim_torque(
+            //    self.radar
+            //        .fighters()
+            //        .next()
+            //        .map(|f| f.heading())
+            //        .unwrap_or(heading()),
+            //);
+            //torque(aim_torque);
         }
 
         for m in missiles {
@@ -170,6 +176,14 @@ impl RadarContact {
         );
     }
 
+    /// (+- dist, width)
+    fn radar_track_radius(&self) -> (f64, f64) {
+        let dist_range = self.velocity.length() * TICK_LENGTH;
+        let circumference = self.distance() * TAU;
+        let x = dist_range / circumference;
+        (dist_range, x)
+    }
+
     fn closest_intercept_time(&self) -> f64 {
         let dir = self.direction();
         let closing_speed = velocity().dot(dir) + self.velocity.dot(-dir);
@@ -197,18 +211,20 @@ impl RadarContact {
         let mut closest_dist = (self.position_in(time) - velocity() * time).distance(
             position()
                 + ((self.position_in(time) - velocity() * time) - position()).normalize()
-                    * projectile_speed,
+                    * projectile_speed
+                    * time,
         );
         let mut closest_time = time;
 
         for i in -10..=10 {
-            let t = time + time * i as f64 / 20.;
-            let dist = (self.position_in(t) - velocity() * t).distance(
-                position()
-                    + ((self.position_in(t) - velocity() * t) - position()).normalize()
-                        * projectile_speed,
-            );
+            let t = time + time * (i as f64 / 200.);
+            let rel_vel_pos = self.position_in(t) - velocity() * t;
+            let bullet_pos =
+                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
+            let dist = rel_vel_pos.distance(bullet_pos);
             if dist < closest_dist {
+                draw_square(rel_vel_pos, 200., 0xFFFF_FFFF);
+                draw_square(bullet_pos, 200., 0xFFFF_FF00);
                 closest_time = t;
                 closest_dist = dist;
             }
@@ -266,7 +282,7 @@ struct UnifiedRadar {
 impl UnifiedRadar {
     const TWS_TRACK_FOV: f64 = 0.001 * TAU;
     const TWS_TRACK_DIST_RANGE: f64 = 100.;
-    const TWS_TRACK_LOST_ZOOM_FACTOR: f64 = 100.;
+    const TWS_TRACK_LOST_ZOOM_FACTOR: f64 = 5000.;
     const CONTACT_FUSE_DIST_PER_KM: f64 = 200.;
 
     fn new(
@@ -317,11 +333,11 @@ impl UnifiedRadar {
             .flatten();
 
         if let Some(c) = track_contact {
-            let zoom = 1. + elapsed(c.time) * Self::TWS_TRACK_LOST_ZOOM_FACTOR;
-            let radial_zoom = 1. + zoom * TAU / (c.distance() * 0.001);
-            set_radar_min_distance(c.distance() - Self::TWS_TRACK_DIST_RANGE * zoom);
-            set_radar_max_distance(c.distance() + Self::TWS_TRACK_DIST_RANGE * zoom);
-            set_radar_width(Self::TWS_TRACK_FOV * radial_zoom);
+            let zoom = elapsed(c.time) * Self::TWS_TRACK_LOST_ZOOM_FACTOR;
+            let (d, r) = c.radar_track_radius();
+            set_radar_min_distance(c.distance() - d - zoom);
+            set_radar_max_distance(c.distance() + d + zoom);
+            set_radar_width(r + zoom * 0.00005);
             set_radar_heading(c.heading());
         } else {
             set_radar_width(self.scan_fov);

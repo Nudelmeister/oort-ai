@@ -258,15 +258,15 @@ impl Missile {
 
     fn tick_boost(&mut self, contact: &RadarContact) {
         let boost_fuel = fuel() + Self::BOOST_BUDGET - 2000.;
-        if boost_fuel < 0. {
+
+        let tti = contact.distance() / contact.closing_speed();
+        if boost_fuel < 0. || (tti.is_sign_positive() && tti < 1.) {
             deactivate_ability(Ability::Boost);
             accelerate(Vec2::zero());
             self.stage = MissileStage::Cruise;
             return;
         }
         debug!("Boost");
-
-        let tti = contact.distance() / contact.closing_speed();
         let lead_time = if tti.is_sign_positive() {
             tti.min(Self::MAX_TTI)
         } else {
@@ -585,10 +585,10 @@ impl Fighter {
                 0.0..=40_000.,
                 0.,
                 TAU,
-                TAU * TICK_LENGTH / 2.,
+                TAU * TICK_LENGTH / 5.,
                 Some(Box::new(|c| c.snr > 2.)),
             ),
-            aimbot: AimBot::new(120., -120_000.),
+            aimbot: AimBot::new(70., -50_000.),
             aim_id: 0,
             next_missile_id: 0,
         }
@@ -615,7 +615,7 @@ impl Fighter {
             self.radar.start_tracking(f.id);
             self.radar.scan_direction = f.direction().angle();
             self.radar.scan_fov = TAU * TICK_LENGTH * 2.;
-            self.radar.scan_angle_max = 0.125 * TAU;
+            self.radar.scan_angle_max = 0.25 * TAU;
             //let lead_pos = f.position_in(f.projectile_impact_time(BULLET_SPEED));
             //draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
             //let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
@@ -654,20 +654,20 @@ impl Fighter {
                 });
                 send_bytes(&message.to_bytes());
                 draw_triangle(position(), 1000., 0xFFA0_A0FF);
-            } else if !missiles.is_empty() {
-                let idx = current_tick() % missiles.len() as u32;
-                let m = missiles[idx as usize];
-                let message = Message::PotentialTarget(TargetUpdate {
-                    missile_id: PackedOptionU16::make(None),
-                    target: TargetMsg {
-                        class: Class::Missile,
-                        confidence: m.confidence as f32,
-                        pos: m.position().into(),
-                        vel: m.velocity.into(),
-                    },
-                });
-                send_bytes(&message.to_bytes());
-                draw_triangle(position(), 1000., 0xFFA0_A0FF);
+            //} else if !missiles.is_empty() {
+            //let idx = current_tick() % missiles.len() as u32;
+            //let m = missiles[idx as usize];
+            //let message = Message::PotentialTarget(TargetUpdate {
+            //    missile_id: PackedOptionU16::make(None),
+            //    target: TargetMsg {
+            //        class: Class::Missile,
+            //        confidence: m.confidence as f32,
+            //        pos: m.position().into(),
+            //        vel: m.velocity.into(),
+            //    },
+            //});
+            //send_bytes(&message.to_bytes());
+            //draw_triangle(position(), 1000., 0xFFA0_A0FF);
             } else if current_tick() % 25 == 0
                 && self.next_missile_id >= 2
                 && self.next_missile_id % 2 == 0
@@ -688,7 +688,7 @@ impl Fighter {
                 (intersept_pos.distance(position_in(intercept_time)) < 200.)
                     .then_some((m, intercept_time))
             })
-            .filter(|(_, t)| t.is_sign_positive())
+            .filter(|(_, t)| t.is_sign_positive() && *t < 10.)
             .min_by_key(|(_, t)| (t * 1000.) as i64)
         {
             if self.aim_id != missile.id {
@@ -697,7 +697,17 @@ impl Fighter {
             self.aim_id = missile.id;
             debug!("{}, d: {}", missile.id, impact_time);
             let lead_heading = missile.projectile_lead_heading(BULLET_SPEED);
-            torque(self.aimbot.aim_torque(lead_heading) + rand(-20., 20.));
+            let lead_heading = if (current_tick() / 30) % 2 == 0 {
+                lead_heading + ((current_tick() % 30) as f64 - 15.) * 0.0002 * TAU
+            } else {
+                lead_heading + (-((current_tick() % 30) as f64) + 15.) * 0.0002 * TAU
+            };
+            draw_line(
+                position(),
+                position() + vec2(1000., 0.).rotate(lead_heading),
+                0xFFFF_0000,
+            );
+            torque(self.aimbot.aim_torque(lead_heading));
             if angle_diff(heading(), lead_heading).abs() < 0.01 * TAU {
                 fire(0);
             }
@@ -725,21 +735,27 @@ impl Fighter {
     fn tick_movement(&self) {
         const DESIRED_CLOSING_SPEED: f64 = 100.;
         const UP_DOWN_SPEED: f64 = 500.;
+        debug!("pos: {:?}", position());
+        let avoid_edge_acc = if position().x.abs() > 17_000. || position().y.abs() > 17_000. {
+            -position() * 0.1
+        } else {
+            -position() * 0.001
+        };
         let to_acc = if let Some(c) = self.radar.fighters().next() {
             let dir = c.direction();
             let closing_speed = c.closing_speed();
-            dir * (DESIRED_CLOSING_SPEED - closing_speed).max(0.)
+            dir * (DESIRED_CLOSING_SPEED - closing_speed).max(-100.)
         } else {
             Vec2::zero()
         };
-        let up_down_acc = if position().y > 2_000. {
+        let up_down_acc = if position().y > 10_000. {
             -velocity().y - UP_DOWN_SPEED
-        } else if position().y < -2_000. {
+        } else if position().y < -10_000. {
             UP_DOWN_SPEED - velocity().y
         } else {
             velocity().y.signum() * (UP_DOWN_SPEED - velocity().y.abs())
         };
-        accelerate(to_acc + vec2(0., 1.) * up_down_acc);
+        accelerate(to_acc + vec2(0., 1.) * up_down_acc + avoid_edge_acc);
     }
 }
 
@@ -853,6 +869,18 @@ impl RadarContact {
                 closest_dist = dist;
             }
         }
+        let time = closest_time;
+        for i in -5..=5 {
+            let t = time + time * i as f64 / 5000.;
+            let rel_vel_pos = self.position_in(t) - velocity() * t;
+            let bullet_pos =
+                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
+            let dist = rel_vel_pos.distance(bullet_pos);
+            if dist < closest_dist {
+                closest_time = t;
+                closest_dist = dist;
+            }
+        }
         closest_time
     }
 
@@ -906,6 +934,7 @@ struct UnifiedRadar {
     contact_timeout: f64,
     filter: Option<ScanFilter>,
     tracking: Vec<u32>,
+    check_behind: bool,
 }
 
 impl UnifiedRadar {
@@ -933,6 +962,7 @@ impl UnifiedRadar {
             contact_timeout,
             filter,
             tracking: Vec::new(),
+            check_behind: false,
         }
     }
 
@@ -970,28 +1000,35 @@ impl UnifiedRadar {
             set_radar_heading(c.heading());
         } else {
             set_radar_width(self.scan_fov);
-            self.scan_heading += self.scan_fov;
-            if angle_diff(self.scan_heading, self.scan_direction).abs() > self.scan_angle_max {
-                self.scan_heading = self.scan_direction - self.scan_angle_max;
-            }
-            set_radar_heading(self.scan_heading);
-            if let Some(same_heading_track_dist) = self
-                .tracking
-                .iter()
-                .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
-                .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
-                .map(|tc| tc.distance())
-                .min_by_key(|d| (d * 1000.) as i64)
-            {
-                set_radar_max_distance(
-                    self.scan_distance_range
-                        .end()
-                        .min(same_heading_track_dist - 100.),
-                );
-            } else {
+            if self.check_behind {
+                self.check_behind = false;
+                set_radar_min_distance(radar_max_distance() + 200.);
                 set_radar_max_distance(*self.scan_distance_range.end());
+            } else {
+                self.scan_heading += self.scan_fov;
+                if angle_diff(self.scan_heading, self.scan_direction).abs() > self.scan_angle_max {
+                    self.scan_heading = self.scan_direction - self.scan_angle_max;
+                }
+                set_radar_heading(self.scan_heading);
+                if let Some(same_heading_track_dist) = self
+                    .tracking
+                    .iter()
+                    .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
+                    .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
+                    .map(|tc| tc.distance())
+                    .min_by_key(|d| (d * 1000.) as i64)
+                {
+                    set_radar_max_distance(
+                        self.scan_distance_range
+                            .end()
+                            .min(same_heading_track_dist - 100.),
+                    );
+                    self.check_behind = true;
+                } else {
+                    set_radar_max_distance(*self.scan_distance_range.end());
+                }
+                set_radar_min_distance(*self.scan_distance_range.start());
             }
-            set_radar_min_distance(*self.scan_distance_range.start());
         }
         self.evict_contacts();
         self.merge_contacts();

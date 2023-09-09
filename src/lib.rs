@@ -719,7 +719,27 @@ impl Fighter {
             }
         }
 
-        accelerate(vec2(10., -position().y));
+        self.tick_movement();
+    }
+
+    fn tick_movement(&self) {
+        const DESIRED_CLOSING_SPEED: f64 = 100.;
+        const UP_DOWN_SPEED: f64 = 500.;
+        let to_acc = if let Some(c) = self.radar.fighters().next() {
+            let dir = c.direction();
+            let closing_speed = c.closing_speed();
+            dir * (DESIRED_CLOSING_SPEED - closing_speed).max(0.)
+        } else {
+            Vec2::zero()
+        };
+        let up_down_acc = if position().y > 2_000. {
+            -velocity().y - UP_DOWN_SPEED
+        } else if position().y < -2_000. {
+            UP_DOWN_SPEED - velocity().y
+        } else {
+            velocity().y.signum() * (UP_DOWN_SPEED - velocity().y.abs())
+        };
+        accelerate(to_acc + vec2(0., 1.) * up_down_acc);
     }
 }
 

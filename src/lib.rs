@@ -36,12 +36,20 @@ impl Ship {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissileStage {
+    Boost,
+    Cruise,
+    Terminal,
+}
+
 pub struct Missile {
     id: Option<u16>,
     radar: UnifiedRadar,
     paired: Option<u16>,
     paired_tti: Option<f64>,
     explode_dist: f64,
+    stage: MissileStage,
 }
 impl Default for Missile {
     fn default() -> Self {
@@ -64,6 +72,7 @@ impl Missile {
             paired: None,
             paired_tti: None,
             explode_dist: 50.,
+            stage: MissileStage::Boost,
         }
     }
 
@@ -167,7 +176,7 @@ impl Missile {
             );
             self.radar.start_tracking(contact_id);
             self.radar.filter = Some(Box::new(move |x| x.class == msg.target.class));
-            self.explode_dist = 100.;
+            self.explode_dist = 50.;
         }
     }
 
@@ -205,9 +214,11 @@ impl Missile {
     }
 
     fn tick(&mut self) {
-        const SIDE_BUDGET: f64 = 1200.;
-        self.receive();
-        self.send();
+        const SIDE_BUDGET: f64 = 1500.;
+        if self.stage != MissileStage::Terminal {
+            self.receive();
+            self.send();
+        }
         self.radar.tick();
 
         let Some(contact) = self.radar.contacts.get(0).copied() else {
@@ -219,6 +230,12 @@ impl Missile {
         contact.debug();
         self.radar.scan_direction = contact.heading();
         self.radar.scan_angle_max = 0.05 * TAU;
+
+        match self.stage {
+            MissileStage::Boost => self.tick_boost(&contact),
+            MissileStage::Cruise => self.tick_cruise(&contact),
+            MissileStage::Terminal => self.tick_terminal(&contact),
+        }
 
         let towards_dir = contact.direction();
         let side_dir = towards_dir.rotate(0.25 * TAU);
@@ -233,6 +250,7 @@ impl Missile {
             .unwrap_or(0.);
         draw_diamond(contact.position_in(impact_time), 150., 0xFFFF_0000);
         debug!("Boom in {:.3}s", impact_time);
+        return;
         if let Some(p_tti) = self.paired_tti {
             debug!(
                 "Partner Boom in {:.3}s, delta: {:.3}",
@@ -265,6 +283,112 @@ impl Missile {
             accelerate(acc);
         } else {
             accelerate(Vec2::zero());
+        }
+    }
+
+    fn tick_boost(&mut self, contact: &RadarContact) {
+        const BOOST_BUDGET: f64 = 1000.;
+        let boost_fuel = fuel() + BOOST_BUDGET - 2000.;
+        if boost_fuel < 0. {
+            activate_ability(Ability::None);
+            accelerate(Vec2::zero());
+            self.stage = MissileStage::Cruise;
+            return;
+        }
+        debug!("Boost");
+
+        let tti = contact.closest_intercept_time();
+        let lead_time = if tti.is_sign_positive() {
+            tti.min(10.)
+        } else {
+            10.
+        };
+
+        let lead_pos = contact.position_in(lead_time);
+        draw_line(position(), lead_pos, 0xFF00_FF00);
+
+        let lead_dir = (lead_pos - position()).normalize();
+        let side_dir = lead_dir.rotate(0.25 * TAU);
+        let side_vel = side_dir * velocity().normalize().dot(side_dir);
+        let acc_dir = lead_dir - side_vel;
+
+        accelerate(acc_dir * max_forward_acceleration());
+        turn(10. * angle_diff(heading(), acc_dir.angle()));
+        activate_ability(Ability::Boost);
+    }
+
+    fn tick_cruise(&mut self, contact: &RadarContact) {
+        debug!("Cruise");
+        let tti = contact.distance() / contact.closing_speed();
+        let terminal_tti = contact.distance() / (contact.closing_speed() + 0.5 * fuel());
+        debug!("tti {:.2} t-tti {:.2}", tti, terminal_tti);
+
+        if terminal_tti < 5. || max_forward_acceleration() * terminal_tti < fuel() {
+            self.stage = MissileStage::Terminal;
+            return;
+        }
+
+        let intercept_time = contact.closest_intercept_time();
+        let intercept_pos = contact.position_in(intercept_time);
+        let intercept_my_pos = position_in(intercept_time);
+        let intercept_pos_dir = (intercept_pos - position()).normalize();
+        let intercept_pos_side_dir = intercept_pos_dir.rotate(0.25 * TAU);
+        let miss_dv =
+            (intercept_pos - intercept_my_pos).dot(intercept_pos_side_dir) * intercept_pos_side_dir;
+        let miss_cont_acc = miss_dv / tti;
+
+        // We could correct our velocity within terminal time and have enough fuel to do so
+        if miss_cont_acc.length() < max_forward_acceleration() * terminal_tti
+            && fuel() > miss_dv.length()
+        {
+            debug!("Chillin");
+            accelerate(Vec2::zero());
+        } else {
+            turn(10. * angle_diff(heading(), miss_cont_acc.angle()));
+            accelerate(miss_cont_acc);
+        }
+
+        debug!("Correction dv: {:.2}", miss_dv.length());
+        draw_line(position(), intercept_pos, 0xFF00_FF00);
+    }
+    fn tick_terminal(&mut self, contact: &RadarContact) {
+        debug!("Terminal");
+        let tti = contact.distance() / (contact.closing_speed() + 0.5 * fuel());
+
+        let impact_pos = contact.position_in(tti);
+
+        let impact_dir = (impact_pos - position()).normalize();
+        let impact_side_dir = impact_dir.rotate(0.25 * TAU);
+        let side_vel = velocity().dot(impact_side_dir) * impact_side_dir;
+        let side_acc = 2. * -side_vel / tti;
+
+        let acc_length = (fuel() / tti).min(max_forward_acceleration());
+        let toward_acc = if acc_length > side_acc.length() {
+            impact_dir * (acc_length.powi(2) - side_acc.length().powi(2)).sqrt()
+        } else {
+            Vec2::zero()
+        };
+
+        let acc = side_acc + toward_acc;
+        if acc.length() > max_forward_acceleration() {
+            activate_ability(Ability::Boost);
+        }
+        turn(10. * angle_diff(heading(), acc.angle()));
+        if fuel() > 10. {
+            accelerate(acc);
+        } else {
+            activate_ability(Ability::None);
+            accelerate(Vec2::zero());
+        }
+        debug!("tti {:.3}", tti);
+        debug!("side_vel {:.3}", side_vel.length());
+        debug!("side_acc {:.3}", side_acc.length());
+        debug!("to_acc {:.3}", toward_acc.length());
+        debug!("acc {:.3}", acc.length());
+        debug!("acc l {:.3}", acc_length);
+
+        if health() < 20. || tti <= TICK_LENGTH || contact.distance() < self.explode_dist {
+            explode();
         }
     }
 }
@@ -551,12 +675,12 @@ impl Fighter {
                 });
                 send_bytes(&message.to_bytes());
             } else if current_tick() % 25 == 0 && self.next_missile_id >= 2 {
-                let message = Message::Pair(Pair {
-                    missile_id_a: self.next_missile_id - 1,
-                    missile_id_b: self.next_missile_id - 2,
-                });
-                send_bytes(&message.to_bytes());
-                draw_triangle(position(), 1000., 0xFFA0_A0FF);
+                //let message = Message::Pair(Pair {
+                //    missile_id_a: self.next_missile_id - 1,
+                //    missile_id_b: self.next_missile_id - 2,
+                //});
+                //send_bytes(&message.to_bytes());
+                //draw_triangle(position(), 1000., 0xFFA0_A0FF);
             }
         }
         if let Some((missile, impact_time)) = missiles
@@ -598,7 +722,7 @@ impl Fighter {
             }
         }
 
-        accelerate(vec2(0., -position().y));
+        accelerate(vec2(10., -position().y));
     }
 }
 
@@ -639,6 +763,11 @@ impl RadarContact {
             self.id,
             elapsed(self.time)
         );
+    }
+
+    fn closing_speed(&self) -> f64 {
+        let dir = self.direction();
+        velocity().dot(dir) + self.velocity.dot(-dir)
     }
 
     /// (+- dist, width)

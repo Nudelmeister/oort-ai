@@ -153,6 +153,7 @@ impl Missile {
             self.radar.start_tracking(contact_id);
             self.radar.contact_timeout = 0.5;
             self.explode_dist = 25.;
+            deactivate_ability(Ability::ShapedCharge);
         }
     }
 
@@ -179,7 +180,8 @@ impl Missile {
                 snr: msg.target.confidence as f64 * 10.,
             });
             self.radar.filter = Some(Box::new(move |x| x.class == msg.target.class));
-            self.explode_dist = 50.;
+            self.explode_dist = 250.;
+            activate_ability(Ability::ShapedCharge);
         }
     }
 
@@ -336,7 +338,8 @@ impl Missile {
         debug!("Terminal");
         let tti = contact.distance() / (contact.closing_speed() + 0.5 * fuel());
 
-        let impact_pos = contact.position_in(tti);
+        let impact_pos = contact.position_in(tti)
+            - (contact.position_in(tti) - position()).normalize() * self.explode_dist;
         draw_line(position(), impact_pos, 0xFF00_FF00);
 
         let impact_dir = (impact_pos - position()).normalize();
@@ -588,7 +591,7 @@ impl Fighter {
                 TAU * TICK_LENGTH / 5.,
                 Some(Box::new(|c| c.snr > 2.)),
             ),
-            aimbot: AimBot::new(70., -50_000.),
+            aimbot: AimBot::new(70., -70_000.),
             aim_id: 0,
             next_missile_id: 0,
         }
@@ -654,20 +657,20 @@ impl Fighter {
                 });
                 send_bytes(&message.to_bytes());
                 draw_triangle(position(), 1000., 0xFFA0_A0FF);
-            //} else if !missiles.is_empty() {
-            //let idx = current_tick() % missiles.len() as u32;
-            //let m = missiles[idx as usize];
-            //let message = Message::PotentialTarget(TargetUpdate {
-            //    missile_id: PackedOptionU16::make(None),
-            //    target: TargetMsg {
-            //        class: Class::Missile,
-            //        confidence: m.confidence as f32,
-            //        pos: m.position().into(),
-            //        vel: m.velocity.into(),
-            //    },
-            //});
-            //send_bytes(&message.to_bytes());
-            //draw_triangle(position(), 1000., 0xFFA0_A0FF);
+            } else if !missiles.is_empty() {
+                let idx = current_tick() % missiles.len() as u32;
+                let m = missiles[idx as usize];
+                let message = Message::PotentialTarget(TargetUpdate {
+                    missile_id: PackedOptionU16::make(None),
+                    target: TargetMsg {
+                        class: Class::Missile,
+                        confidence: m.confidence as f32,
+                        pos: m.position().into(),
+                        vel: m.velocity.into(),
+                    },
+                });
+                send_bytes(&message.to_bytes());
+                draw_triangle(position(), 1000., 0xFFA0_A0FF);
             } else if current_tick() % 25 == 0
                 && self.next_missile_id >= 2
                 && self.next_missile_id % 2 == 0
@@ -688,7 +691,7 @@ impl Fighter {
                 (intersept_pos.distance(position_in(intercept_time)) < 200.)
                     .then_some((m, intercept_time))
             })
-            .filter(|(_, t)| t.is_sign_positive() && *t < 10.)
+            .filter(|(_, t)| t.is_sign_positive() && *t < 6.)
             .min_by_key(|(_, t)| (t * 1000.) as i64)
         {
             if self.aim_id != missile.id {
@@ -711,16 +714,15 @@ impl Fighter {
             if angle_diff(heading(), lead_heading).abs() < 0.01 * TAU {
                 fire(0);
             }
-        } else {
-            let aim_torque = self.aimbot.aim_torque(
-                self.radar
-                    .fighters()
-                    .next()
-                    .map(|f| f.projectile_lead_heading(BULLET_SPEED))
-                    .unwrap_or(heading()),
-            );
+        } else if let Some(f) = self.radar.fighters().next() {
+            let lead_heading = f.projectile_lead_heading(BULLET_SPEED);
+            let aim_torque = self.aimbot.aim_torque(lead_heading);
             torque(aim_torque);
-            fire(0);
+            if angle_diff(heading(), lead_heading).abs() < 0.01 * TAU {
+                fire(0);
+            }
+        } else {
+            torque(-angular_velocity());
         }
 
         for m in missiles {
@@ -734,10 +736,10 @@ impl Fighter {
 
     fn tick_movement(&self) {
         const DESIRED_CLOSING_SPEED: f64 = 100.;
-        const UP_DOWN_SPEED: f64 = 500.;
+        const UP_DOWN_SPEED: f64 = 1000.;
         debug!("pos: {:?}", position());
-        let avoid_edge_acc = if position().x.abs() > 17_000. || position().y.abs() > 17_000. {
-            -position() * 0.1
+        let avoid_edge_acc = if position().x.abs() > 16_000. || position().y.abs() > 16_000. {
+            -position() * 0.25
         } else {
             -position() * 0.001
         };
@@ -783,8 +785,16 @@ struct RadarContact {
 
 impl RadarContact {
     fn debug(&self) {
-        draw_square(self.position, 100., class_color(self.class));
-        draw_diamond(self.position(), 100., class_color(self.class));
+        draw_square(
+            self.position,
+            50. + 1000. * (1. - self.confidence),
+            class_color(self.class),
+        );
+        draw_diamond(
+            self.position(),
+            50. + 1000. * (1. - self.confidence),
+            class_color(self.class),
+        );
         draw_line(
             self.position(),
             self.position() + self.velocity,
@@ -793,8 +803,8 @@ impl RadarContact {
         draw_text!(
             self.position(),
             class_color(self.class),
-            "{} t: {:.2}",
-            self.id,
+            "c{:.1} t{:.1}",
+            self.confidence,
             elapsed(self.time)
         );
     }
@@ -904,8 +914,8 @@ impl RadarContact {
     }
 
     fn integrate(&mut self, contact: &ScanResult) {
-        let conf = (0.1 * (contact.snr / (0.01 * self.position().distance(contact.position))))
-            .clamp(0.25, 1.);
+        let conf = 1.
+            * (contact.snr / (0.01 * self.position().distance(contact.position))).clamp(0.25, 1.);
         let inv_conf = 1. - conf;
         self.confidence = self.confidence * inv_conf + conf * conf;
         self.acceleration = self.acceleration * inv_conf

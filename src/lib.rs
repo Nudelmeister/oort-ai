@@ -1,6 +1,10 @@
 use oort_api::prelude::{
     byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt},
-    maths_rs::{clamp, prelude::Base, Vec2f},
+    maths_rs::{
+        clamp,
+        prelude::{Base, MatInverse, MatTranspose},
+        Mat4d, Vec2f, Vec4d,
+    },
     *,
 };
 use std::{
@@ -945,6 +949,7 @@ struct UnifiedRadar {
     filter: Option<ScanFilter>,
     tracking: Vec<u32>,
     check_behind: bool,
+    _testing_track: Track,
 }
 
 impl UnifiedRadar {
@@ -973,6 +978,7 @@ impl UnifiedRadar {
             filter,
             tracking: Vec::new(),
             check_behind: false,
+            _testing_track: Track::new(),
         }
     }
 
@@ -985,6 +991,7 @@ impl UnifiedRadar {
 
     fn tick(&mut self) {
         debug!("{:?}", self.tracking);
+        self._testing_track.debug();
         match scan() {
             Some(contact) if self.filter.as_mut().map_or(true, |f| f(&contact)) => {
                 self.integrate_contact(&contact);
@@ -1004,10 +1011,16 @@ impl UnifiedRadar {
         if let Some(c) = track_contact {
             let zoom = elapsed(c.time) * Self::TWS_TRACK_LOST_ZOOM_FACTOR;
             let (d, r) = c.radar_track_radius();
-            set_radar_min_distance(c.distance() - d - zoom);
-            set_radar_max_distance(c.distance() + d + zoom);
             set_radar_width(r + zoom * 0.00005);
-            set_radar_heading(c.heading());
+            if c.class == Class::Fighter {
+                let to_track = self._testing_track.position() - position();
+                set_radar_heading(to_track.angle());
+            } else {
+                set_radar_heading(c.heading());
+                set_radar_width(r + zoom * 0.00005);
+                set_radar_min_distance(c.distance() - d - zoom);
+                set_radar_max_distance(c.distance() + d + zoom);
+            }
         } else {
             set_radar_width(self.scan_fov);
             if self.check_behind {
@@ -1045,6 +1058,9 @@ impl UnifiedRadar {
     }
 
     fn integrate_contact(&mut self, contact: &ScanResult) {
+        if contact.class == Class::Fighter {
+            self._testing_track.update(contact);
+        }
         if let Some(matching_contact) = self
             .contacts
             .iter_mut()
@@ -1179,4 +1195,142 @@ impl AimBot {
         self.last_time = current_time();
         p_term + d_term
     }
+}
+
+struct Track {
+    id: u16,
+    class: Class,
+    last_seen: f64,
+    state: Vec4d,
+    state_cov: Mat4d,
+}
+
+impl Track {
+    fn new() -> Self {
+        Self {
+            id: 0,
+            class: Class::Unknown,
+            last_seen: 0.,
+            state: Vec4d::zero(),
+            state_cov: Mat4d::zero(),
+        }
+    }
+    fn debug(&self) {
+        let p_pos = self.position();
+        let state_pos = Vec2::new(self.state.x, self.state.y);
+        draw_square(state_pos, 100., 0xFFFF_FFFF);
+        draw_diamond(p_pos, 100., 0xFFFF_FFFF);
+        draw_polygon(
+            state_pos,
+            100. * (self.state_cov.at(0, 0) + self.state_cov.at(1, 1)),
+            32,
+            0.,
+            0xFFA0_A0A0,
+        );
+    }
+    fn position(&self) -> Vec2 {
+        let (p_state, _) = predict(&self.state, &self.state_cov, elapsed(self.last_seen));
+        Vec2::new(p_state.x, p_state.y)
+    }
+    fn update(&mut self, scan: &ScanResult) {
+        let observ = Vec4d::new(
+            scan.position.x,
+            scan.position.y,
+            scan.velocity.x,
+            scan.velocity.y,
+        );
+        update(
+            &mut self.state,
+            &mut self.state_cov,
+            &observ,
+            elapsed(self.last_seen),
+            scan.snr,
+            scan.rssi,
+        );
+        self.class = scan.class;
+        self.last_seen = current_time();
+    }
+}
+
+fn predict(state: &Vec4d, state_cov: &Mat4d, time: f64) -> (Vec4d, Mat4d) {
+    let stm = state_transition_model(time);
+    let q = Mat4d::identity();
+    let p_state = stm * state; // + B*u
+    let p_state_cov = mat4_add(&((stm * state_cov) * stm.transpose()), q);
+    (p_state, p_state_cov)
+}
+
+fn update(
+    state: &mut Vec4d,
+    state_cov: &mut Mat4d,
+    observ: &Vec4d,
+    time: f64,
+    snr: f64,
+    rssi: f64,
+) -> Vec4d {
+    let om = observation_model();
+    let r = observation_noise_cov(snr, rssi);
+    let (p_state, p_state_cov) = predict(state, state_cov, time);
+    let innovation = observ - om * p_state;
+    let innovation_cov = mat4_add(&((om * p_state_cov) * om.transpose()), r);
+    let opt_gain = (p_state_cov * om.transpose()) * innovation_cov.inverse();
+
+    *state = p_state + opt_gain * innovation;
+    *state_cov = mat4_sub(&Mat4d::identity(), opt_gain * om) * p_state_cov;
+
+    observ - om * *state
+}
+
+fn state_transition_model(time: f64) -> Mat4d {
+    let t = time;
+    Mat4d {
+        m: [
+            1., 0., t, 0., // pos x
+            0., 1., 0., t, // pos y
+            0., 0., 1., 0., // vel x
+            0., 0., 0., 1., // vel y
+        ],
+    }
+}
+
+const fn observation_model() -> Mat4d {
+    Mat4d {
+        m: [
+            1., 0., 0., 0., // pos x
+            0., 1., 0., 0., // pos y
+            0., 0., 1., 0., // vel x
+            0., 0., 0., 1., // vel y
+        ],
+    }
+}
+fn observation_noise_cov(snr: f64, rssi: f64) -> Mat4d {
+    debug!("snr: {}, rssi: {}", snr, rssi);
+    let x = 20. * snr.recip() * -rssi;
+    Mat4d {
+        m: [
+            x, 0., 0., 0., // pos x
+            0., x, 0., 0., // pos y
+            0., 0., x, 0., // vel x
+            0., 0., 0., x, // vel y
+        ],
+    }
+}
+
+fn mat4_add(lhs: &Mat4d, rhs: Mat4d) -> Mat4d {
+    let mut m = [0.; 16];
+    lhs.m
+        .iter()
+        .zip(&rhs.m)
+        .zip(&mut m)
+        .for_each(|((l, r), m)| *m = l + r);
+    Mat4d { m }
+}
+fn mat4_sub(lhs: &Mat4d, rhs: Mat4d) -> Mat4d {
+    let mut m = [0.; 16];
+    lhs.m
+        .iter()
+        .zip(&rhs.m)
+        .zip(&mut m)
+        .for_each(|((l, r), m)| *m = l - r);
+    Mat4d { m }
 }

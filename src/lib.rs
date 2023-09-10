@@ -589,7 +589,7 @@ impl Fighter {
                 0.0..=40_000.,
                 0.,
                 TAU,
-                TAU * TICK_LENGTH / 5.,
+                TAU * TICK_LENGTH * 2.,
                 Some(Box::new(|c| c.snr > 2.)),
             ),
             aimbot: AimBot::new(70., -70_000.),
@@ -611,15 +611,15 @@ impl Fighter {
         let fighters = self.radar.fighters().cloned().collect::<Vec<_>>();
         let missiles = self.radar.missiles().cloned().collect::<Vec<_>>();
         if fighters.is_empty() {
-            self.radar.scan_direction = 0.;
-            self.radar.scan_angle_max = TAU;
-            self.radar.scan_fov = TAU * TICK_LENGTH / 2.;
+            //self.radar.scan_direction = 0.;
+            //self.radar.scan_angle_max = TAU;
+            //self.radar.scan_fov = TAU * TICK_LENGTH / 2.;
         }
         for f in fighters.iter().take(1) {
-            self.radar.start_tracking(f.id);
-            self.radar.scan_direction = f.direction().angle();
-            self.radar.scan_fov = TAU * TICK_LENGTH * 2.;
-            self.radar.scan_angle_max = 0.25 * TAU;
+            //self.radar.start_tracking(f.id);
+            //self.radar.scan_direction = f.direction().angle();
+            //self.radar.scan_fov = TAU * TICK_LENGTH * 8.;
+            //self.radar.scan_angle_max = TAU;
             //let lead_pos = f.position_in(f.projectile_impact_time(BULLET_SPEED));
             //draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
             //let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
@@ -773,173 +773,18 @@ fn class_color(class: Class) -> u32 {
     }
 }
 
-//#[derive(Debug, Clone, Copy)]
-//struct Track2 {
-//    id: u32,
-//    class: Class,
-//    confidence: f64,
-//    time: f64,
-//    position: Vec2,
-//    velocity: Vec2,
-//    acceleration: Vec2,
-//}
-//
-//impl Track2 {
-//    fn debug(&self) {
-//        //draw_square(
-//        //    self.position,
-//        //    50. + 1000. * (1. - self.confidence),
-//        //    class_color(self.class),
-//        //);
-//        //draw_diamond(
-//        //    self.position(),
-//        //    50. + 1000. * (1. - self.confidence),
-//        //    class_color(self.class),
-//        //);
-//        //draw_line(
-//        //    self.position(),
-//        //    self.position() + self.velocity,
-//        //    class_color(self.class),
-//        //);
-//        //draw_text!(
-//        //    self.position(),
-//        //    class_color(self.class),
-//        //    "c{:.1} t{:.1}",
-//        //    self.confidence,
-//        //    elapsed(self.time)
-//        //);
-//    }
-//
-//    fn closing_speed(&self) -> f64 {
-//        let dir = self.direction();
-//        velocity().dot(dir) + self.velocity.dot(-dir)
-//    }
-//
-//    /// (+- dist, width)
-//    fn radar_track_radius(&self) -> (f64, f64) {
-//        let dist_range = 10. * self.velocity.length() * TICK_LENGTH;
-//        let circumference = self.distance() * TAU;
-//        let x = dist_range / circumference;
-//        (dist_range, x)
-//    }
-//
-//    fn closest_intercept_time(&self) -> f64 {
-//        self.projectile_impact_time(0.)
-//    }
-//
-//    fn projectile_lead_heading(&self, projectile_speed: f64) -> f64 {
-//        let t = self.projectile_impact_time(projectile_speed);
-//        ((self.position_in(t) - velocity() * t) - position()).angle()
-//    }
-//
-//    fn projectile_impact_time(&self, projectile_speed: f64) -> f64 {
-//        let dir = self.direction();
-//        let time =
-//            self.distance() / (projectile_speed + velocity().dot(dir) + self.velocity.dot(-dir));
-//
-//        let mut closest_dist = (self.position_in(time) - velocity() * time).distance(
-//            position()
-//                + ((self.position_in(time) - velocity() * time) - position()).normalize()
-//                    * projectile_speed
-//                    * time,
-//        );
-//        let mut closest_time = time;
-//
-//        for i in -1..=10 {
-//            let t = time + time * i as f64 / 5.;
-//            let rel_vel_pos = self.position_in(t) - velocity() * t;
-//            let bullet_pos =
-//                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-//            let dist = rel_vel_pos.distance(bullet_pos);
-//            if dist < closest_dist {
-//                closest_time = t;
-//                closest_dist = dist;
-//            }
-//        }
-//        let time = closest_time;
-//        for i in -5..=5 {
-//            let t = time + time * i as f64 / 50.;
-//            let rel_vel_pos = self.position_in(t) - velocity() * t;
-//            let bullet_pos =
-//                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-//            let dist = rel_vel_pos.distance(bullet_pos);
-//            if dist < closest_dist {
-//                closest_time = t;
-//                closest_dist = dist;
-//            }
-//        }
-//        let time = closest_time;
-//        for i in -5..=5 {
-//            let t = time + time * i as f64 / 500.;
-//            let rel_vel_pos = self.position_in(t) - velocity() * t;
-//            let bullet_pos =
-//                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-//            let dist = rel_vel_pos.distance(bullet_pos);
-//            if dist < closest_dist {
-//                closest_time = t;
-//                closest_dist = dist;
-//            }
-//        }
-//        let time = closest_time;
-//        for i in -5..=5 {
-//            let t = time + time * i as f64 / 5000.;
-//            let rel_vel_pos = self.position_in(t) - velocity() * t;
-//            let bullet_pos =
-//                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-//            let dist = rel_vel_pos.distance(bullet_pos);
-//            if dist < closest_dist {
-//                closest_time = t;
-//                closest_dist = dist;
-//            }
-//        }
-//        closest_time
-//    }
-//
-//    fn position(&self) -> Vec2 {
-//        self.position_in(0.)
-//    }
-//    fn position_in(&self, time: f64) -> Vec2 {
-//        let elapsed = elapsed(self.time) + time;
-//        self.position + self.velocity * elapsed + self.acceleration * elapsed.powi(2) * 0.5
-//    }
-//
-//    fn distance(&self) -> f64 {
-//        self.position().distance(position())
-//    }
-//
-//    fn direction(&self) -> Vec2 {
-//        (self.position() - position()).normalize()
-//    }
-//    fn heading(&self) -> f64 {
-//        self.direction().angle()
-//    }
-//
-//    fn integrate(&mut self, contact: &ScanResult) {
-//        let conf = 1.
-//            * (contact.snr / (0.01 * self.position().distance(contact.position))).clamp(0.25, 1.);
-//        let inv_conf = 1. - conf;
-//        self.confidence = self.confidence * inv_conf + conf * conf;
-//        self.acceleration = self.acceleration * inv_conf
-//            + conf * (contact.velocity - self.velocity) * elapsed(self.time);
-//        self.velocity = self.velocity * inv_conf + conf * contact.velocity;
-//        self.position = self.position * inv_conf + conf * contact.position;
-//        self.time = current_time();
-//        self.class = contact.class;
-//    }
-//}
-
 fn position_in(time: f64) -> Vec2 {
     position() + velocity() * time
 }
 
 fn class_timeout(class: Class) -> f64 {
     match class {
-        Class::Fighter => 2.5,
+        Class::Fighter => 5.,
         Class::Frigate => 5.,
         Class::Cruiser => 10.,
         Class::Asteroid => 30.,
         Class::Target => 2.5,
-        Class::Missile => 0.5,
+        Class::Missile => 0.25,
         Class::Torpedo => 0.5,
         Class::Unknown => 2.5,
     }
@@ -1091,6 +936,7 @@ impl UnifiedRadar {
                     < ((a.position() + b.position()) * 0.5).distance(position())
                         * Self::CONTACT_FUSE_PER_DIST
                 {
+                    // TODO: actually do a proper update
                     let merged = Track {
                         id: a.id,
                         class: a.class,
@@ -1207,9 +1053,9 @@ impl Track {
                 p: pos,
                 v: vel,
                 a: Vec2::zero(),
-                p_c: Vec2::one(),
-                v_c: Vec2::one(),
-                a_c: Vec2::one(),
+                p_c: Vec2::one() * 100.,
+                v_c: Vec2::one() * 100.,
+                a_c: Vec2::one() * 100.,
             },
             //state: Vec4d::new(pos.x, pos.y, vel.x, vel.y),
             //state_cov: mat4_scale(&Mat4d::identity(), 2.),
@@ -1219,17 +1065,11 @@ impl Track {
         let predicted = self.state.predict(elapsed(self.last_seen));
         let err = predicted.p_c.length() + predicted.v_c.length() + predicted.a_c.length();
         let color = class_color(self.class);
-        draw_square(self.state.p, 100. * err * err, color);
-        draw_diamond(predicted.p, 100. * err * err, color);
+        draw_square(self.state.p, 100., color);
+        draw_diamond(predicted.p, 100., color);
         draw_line(predicted.p, predicted.p + predicted.v, color);
         draw_polygon(predicted.p + predicted.a, 25., 8, 0., color);
-        draw_text!(
-            predicted.p,
-            color,
-            "{} T{:.2}",
-            self.id,
-            elapsed(self.last_seen),
-        );
+        draw_text!(predicted.p + Vec2::new(100., 100.), color, "{}", self.id);
     }
     fn position(&self) -> Vec2 {
         self.position_in(0.)
@@ -1257,10 +1097,12 @@ impl Track {
     }
     /// heading, area, distance
     fn radar_track_look(&self) -> (f64, f64, f64) {
-        let predicted = self.state.predict(elapsed(self.last_seen) + TICK_LENGTH);
+        let predicted = self
+            .state
+            .predict(elapsed(self.last_seen) + 2. * TICK_LENGTH);
         let err = predicted.p_c.length() + predicted.v_c.length() + predicted.a_c.length();
         let towards = predicted.p - position();
-        (towards.angle(), 100. * err * err, towards.length())
+        (towards.angle(), 100. * err, towards.length())
     }
     fn projectile_impact_time(&self, projectile_speed: f64) -> f64 {
         let dir = self.direction();

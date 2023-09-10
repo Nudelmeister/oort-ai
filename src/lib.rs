@@ -1,16 +1,9 @@
 use oort_api::prelude::{
     byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt},
-    maths_rs::{
-        clamp,
-        prelude::{Base, MatInverse, MatTranspose},
-        Mat4d, Vec2f, Vec4d,
-    },
+    maths_rs::{prelude::Base, Vec2f},
     *,
 };
-use std::{
-    io::Cursor,
-    ops::{ControlFlow, RangeInclusive},
-};
+use std::{io::Cursor, ops::RangeInclusive};
 
 const BULLET_SPEED: f64 = 1000.0; // m/s
 
@@ -68,14 +61,7 @@ impl Missile {
     pub fn new() -> Self {
         Self {
             id: None,
-            radar: UnifiedRadar::new(
-                20.,
-                0.0..=f64::MAX,
-                0.,
-                TAU,
-                TAU * TICK_LENGTH / 10.,
-                Some(Box::new(|c| c.class == Class::Fighter && c.snr > 10.)),
-            ),
+            radar: UnifiedRadar::new(0.0..=f64::MAX, 0., TAU, TAU * TICK_LENGTH / 10.),
             paired: None,
             paired_tti: None,
             explode_dist: 50.,
@@ -143,7 +129,6 @@ impl Missile {
             {
                 return;
             }
-            self.radar.filter = Some(Box::new(move |x| x.class == c.class));
             self.radar.contacts.clear();
             self.radar.tracking.clear();
             let contact_id = self.radar.add_contact(
@@ -152,7 +137,6 @@ impl Missile {
                 msg.target.class,
             );
             self.radar.start_tracking(contact_id);
-            self.radar.contact_timeout = 0.5;
             self.explode_dist = 25.;
             deactivate_ability(Ability::ShapedCharge);
         }
@@ -180,7 +164,6 @@ impl Missile {
                 rssi: 0.,
                 snr: msg.target.confidence as f64 * 10.,
             });
-            self.radar.filter = Some(Box::new(move |x| x.class == msg.target.class));
             self.explode_dist = 250.;
             activate_ability(Ability::ShapedCharge);
         }
@@ -379,6 +362,7 @@ impl Missile {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Message {
     MissileInit(MissileInit),
     TargetUpdate(TargetUpdate),
@@ -431,6 +415,7 @@ impl Message {
     }
 }
 
+#[derive(Clone, Copy)]
 struct PackedOptionU16(u16);
 impl PackedOptionU16 {
     fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
@@ -446,6 +431,7 @@ impl PackedOptionU16 {
         Self(value.unwrap_or(u16::MAX))
     }
 }
+#[derive(Clone, Copy)]
 struct PairTti {
     sender_missile_id: u16,
     time_to_impact: f32,
@@ -465,6 +451,7 @@ impl PairTti {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Pair {
     missile_id_a: u16,
     missile_id_b: u16,
@@ -484,6 +471,7 @@ impl Pair {
     }
 }
 
+#[derive(Clone, Copy)]
 struct MissileInit {
     missile_id: u16,
     target: TargetMsg,
@@ -499,6 +487,7 @@ impl MissileInit {
         self.target.to_bytes(data);
     }
 }
+#[derive(Clone, Copy)]
 struct TargetUpdate {
     missile_id: PackedOptionU16,
     target: TargetMsg,
@@ -515,6 +504,7 @@ impl TargetUpdate {
     }
 }
 
+#[derive(Clone, Copy)]
 struct TargetMsg {
     class: Class,
     confidence: f32,
@@ -584,14 +574,7 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            radar: UnifiedRadar::new(
-                0.5,
-                0.0..=40_000.,
-                0.,
-                TAU,
-                TAU * TICK_LENGTH * 2.,
-                Some(Box::new(|c| c.snr > 2.)),
-            ),
+            radar: UnifiedRadar::new(0.0..=40_000., 0., TAU, TAU * TICK_LENGTH * 2.),
             aimbot: AimBot::new(70., -70_000.),
             aim_id: 0,
             next_missile_id: 0,
@@ -607,158 +590,8 @@ impl Fighter {
         self.radar.tick();
         for c in self.radar.contacts.clone() {
             c.debug();
+            self.radar.start_tracking(c.id);
         }
-        let fighters = self.radar.fighters().cloned().collect::<Vec<_>>();
-        let missiles = self.radar.missiles().cloned().collect::<Vec<_>>();
-        if fighters.is_empty() {
-            //self.radar.scan_direction = 0.;
-            //self.radar.scan_angle_max = TAU;
-            //self.radar.scan_fov = TAU * TICK_LENGTH / 2.;
-        }
-        for f in fighters.iter().take(1) {
-            //self.radar.start_tracking(f.id);
-            //self.radar.scan_direction = f.direction().angle();
-            //self.radar.scan_fov = TAU * TICK_LENGTH * 8.;
-            //self.radar.scan_angle_max = TAU;
-            //let lead_pos = f.position_in(f.projectile_impact_time(BULLET_SPEED));
-            //draw_diamond(lead_pos, 50., 0xFFA0_A0FF);
-            //let aim_torque = self.aimbot.aim_torque((lead_pos - position()).angle());
-            //torque(aim_torque);
-            //fire(0);
-            //accelerate(
-            //    (f.direction() * 0.5
-            //        + (f.position_in(f.closest_intercept_time()) - position()).normalize() * 0.5)
-            //        * max_forward_acceleration()
-            //        * 0.1,
-            //);
-
-            if reload_ticks(1) == 0 {
-                //fire(1);
-                let message = Message::MissileInit(MissileInit {
-                    missile_id: self.next_missile_id,
-                    target: TargetMsg {
-                        class: Class::Fighter,
-                        confidence: 1.,
-                        pos: f.position().into(),
-                        vel: f.velocity().into(),
-                    },
-                });
-                send_bytes(&message.to_bytes());
-                draw_triangle(position(), 1000., 0xFFA0_A0FF);
-                self.next_missile_id += 1;
-            } else if current_tick() % 60 == 0 {
-                let message = Message::TargetUpdate(TargetUpdate {
-                    missile_id: PackedOptionU16::make(None),
-                    target: TargetMsg {
-                        class: Class::Fighter,
-                        confidence: 1.,
-                        pos: f.position().into(),
-                        vel: f.velocity().into(),
-                    },
-                });
-                send_bytes(&message.to_bytes());
-                draw_triangle(position(), 1000., 0xFFA0_A0FF);
-            } else if !missiles.is_empty() {
-                let idx = current_tick() % missiles.len() as u32;
-                let m = &missiles[idx as usize];
-                let message = Message::PotentialTarget(TargetUpdate {
-                    missile_id: PackedOptionU16::make(None),
-                    target: TargetMsg {
-                        class: Class::Missile,
-                        confidence: 1.,
-                        pos: m.position().into(),
-                        vel: m.velocity().into(),
-                    },
-                });
-                send_bytes(&message.to_bytes());
-                draw_triangle(position(), 1000., 0xFFA0_A0FF);
-            } else if current_tick() % 25 == 0
-                && self.next_missile_id >= 2
-                && self.next_missile_id % 2 == 0
-            {
-                let message = Message::Pair(Pair {
-                    missile_id_a: self.next_missile_id - 1,
-                    missile_id_b: self.next_missile_id - 2,
-                });
-                send_bytes(&message.to_bytes());
-                draw_triangle(position(), 1000., 0xFFA0_A0FF);
-            }
-        }
-        if let Some((missile, impact_time)) = missiles
-            .iter()
-            .filter_map(|m| {
-                let intercept_time = m.closest_intercept_time();
-                let intersept_pos = m.position_in(intercept_time);
-                (intersept_pos.distance(position_in(intercept_time)) < 200.)
-                    .then_some((m, intercept_time))
-            })
-            .filter(|(_, t)| t.is_sign_positive() && *t < 6.)
-            .min_by_key(|(_, t)| (t * 1000.) as i64)
-        {
-            if self.aim_id != missile.id {
-                self.aimbot.reset();
-            }
-            self.aim_id = missile.id;
-            debug!("{}, d: {}", missile.id, impact_time);
-            let lead_heading = missile.projectile_lead_heading(BULLET_SPEED);
-            let lead_heading = if (current_tick() / 30) % 2 == 0 {
-                lead_heading + ((current_tick() % 30) as f64 - 15.) * 0.0002 * TAU
-            } else {
-                lead_heading + (-((current_tick() % 30) as f64) + 15.) * 0.0002 * TAU
-            };
-            draw_line(
-                position(),
-                position() + vec2(1000., 0.).rotate(lead_heading),
-                0xFFFF_0000,
-            );
-            torque(self.aimbot.aim_torque(lead_heading));
-            if angle_diff(heading(), lead_heading).abs() < 0.01 * TAU {
-                fire(0);
-            }
-        } else if let Some(f) = self.radar.fighters().next() {
-            let lead_heading = f.projectile_lead_heading(BULLET_SPEED);
-            let aim_torque = self.aimbot.aim_torque(lead_heading);
-            torque(aim_torque);
-            if angle_diff(heading(), lead_heading).abs() < 0.01 * TAU {
-                fire(0);
-            }
-        } else {
-            torque(-angular_velocity());
-        }
-
-        for m in missiles {
-            if m.distance() < 15000. {
-                self.radar.start_tracking(m.id);
-            }
-        }
-
-        self.tick_movement();
-    }
-
-    fn tick_movement(&self) {
-        const DESIRED_CLOSING_SPEED: f64 = 100.;
-        const UP_DOWN_SPEED: f64 = 1000.;
-        debug!("pos: {:?}", position());
-        let avoid_edge_acc = if position().x.abs() > 16_000. || position().y.abs() > 16_000. {
-            -position() * 0.25
-        } else {
-            -position() * 0.001
-        };
-        let to_acc = if let Some(c) = self.radar.fighters().next() {
-            let dir = c.direction();
-            let closing_speed = c.closing_speed();
-            dir * (DESIRED_CLOSING_SPEED - closing_speed).max(-100.)
-        } else {
-            Vec2::zero()
-        };
-        let up_down_acc = if position().y > 10_000. {
-            -velocity().y - UP_DOWN_SPEED
-        } else if position().y < -10_000. {
-            UP_DOWN_SPEED - velocity().y
-        } else {
-            velocity().y.signum() * (UP_DOWN_SPEED - velocity().y.abs())
-        };
-        accelerate(to_acc + vec2(0., 1.) * up_down_acc + avoid_edge_acc);
     }
 }
 
@@ -779,17 +612,13 @@ fn position_in(time: f64) -> Vec2 {
 
 fn class_timeout(class: Class) -> f64 {
     match class {
-        Class::Fighter => 5.,
         Class::Frigate => 5.,
         Class::Cruiser => 10.,
         Class::Asteroid => 30.,
-        Class::Target => 2.5,
-        Class::Missile => 0.25,
-        Class::Torpedo => 0.5,
-        Class::Unknown => 2.5,
+        Class::Missile | Class::Torpedo => 0.25,
+        Class::Target | Class::Fighter | Class::Unknown => 2.5,
     }
 }
-type ScanFilter = Box<dyn FnMut(&ScanResult) -> bool>;
 
 struct UnifiedRadar {
     next_id: u32,
@@ -799,25 +628,19 @@ struct UnifiedRadar {
     scan_angle_max: f64,
     scan_fov: f64,
     contacts: Vec<Track>,
-    contact_timeout: f64,
-    filter: Option<ScanFilter>,
     tracking: Vec<u32>,
     check_behind: bool,
 }
 
 impl UnifiedRadar {
-    const TWS_TRACK_FOV: f64 = 0.001 * TAU;
-    const TWS_TRACK_DIST_RANGE: f64 = 100.;
-    const TWS_TRACK_LOST_ZOOM_FACTOR: f64 = 2500.;
     const CONTACT_FUSE_PER_DIST: f64 = 0.1;
+    const CONTACT_FUSE_MIN: f64 = 50.;
 
     fn new(
-        contact_timeout: f64,
         scan_distance_range: RangeInclusive<f64>,
         scan_direction: f64,
         scan_angle_max: f64,
         scan_fov: f64,
-        filter: Option<ScanFilter>,
     ) -> Self {
         Self {
             next_id: 0,
@@ -827,8 +650,6 @@ impl UnifiedRadar {
             scan_angle_max,
             scan_fov,
             contacts: Vec::new(),
-            contact_timeout,
-            filter,
             tracking: Vec::new(),
             check_behind: false,
         }
@@ -841,80 +662,88 @@ impl UnifiedRadar {
             .retain(|id| self.contacts.iter().any(|c| c.id == *id));
     }
 
-    fn tick(&mut self) {
-        debug!("{:?}", self.tracking);
-        match scan() {
-            Some(contact) if self.filter.as_mut().map_or(true, |f| f(&contact)) => {
-                self.integrate_contact(&contact);
+    fn prepare_track_tick(&mut self, track_idx: usize) {
+        let track = self
+            .contacts
+            .iter()
+            .find(|c| c.id == self.tracking[track_idx])
+            .unwrap();
+
+        let (h, a, d) = track.radar_track_look();
+        let w = a / d;
+        set_radar_width(w);
+        set_radar_heading(h);
+        set_radar_min_distance(d - 0.5 * a);
+        set_radar_max_distance(d + 0.5 * a);
+    }
+    fn prepare_scan_tick(&mut self) {
+        set_radar_width(self.scan_fov);
+        if self.check_behind {
+            self.check_behind = false;
+            set_radar_min_distance(
+                radar_max_distance() + radar_max_distance() * Self::CONTACT_FUSE_PER_DIST,
+            );
+            set_radar_max_distance(*self.scan_distance_range.end());
+        } else {
+            self.scan_heading += self.scan_fov;
+            if angle_diff(self.scan_heading, self.scan_direction).abs() > self.scan_angle_max {
+                self.scan_heading = self.scan_direction - self.scan_angle_max;
             }
-            _ => (),
+            set_radar_heading(self.scan_heading);
+            if let Some(same_heading_track_dist) = self
+                .tracking
+                .iter()
+                .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
+                .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
+                .map(|tc| tc.distance())
+                .min_by_key(|d| (d * 1000.) as i64)
+            {
+                set_radar_max_distance(self.scan_distance_range.end().min(
+                    same_heading_track_dist - same_heading_track_dist * Self::CONTACT_FUSE_PER_DIST,
+                ));
+                self.check_behind = true;
+            } else {
+                set_radar_max_distance(*self.scan_distance_range.end());
+            }
+            set_radar_min_distance(*self.scan_distance_range.start());
+        }
+    }
+
+    fn tick(&mut self) {
+        if let Some(contact) = scan() {
+            self.integrate_contact(&contact);
         }
 
         let select = current_tick() as usize % (self.tracking.len() + 1);
-        let track_contact = (select != 0)
-            .then(|| {
-                self.contacts
-                    .iter()
-                    .find(|c| c.id == self.tracking[select - 1])
-            })
-            .flatten();
-
-        if let Some(c) = track_contact {
-            let (h, a, d) = c.radar_track_look();
-            let w = a / d;
-            set_radar_width(w);
-            set_radar_heading(h);
-            set_radar_min_distance(d - 0.5 * a);
-            set_radar_max_distance(d + 0.5 * a);
+        if select > 0 {
+            self.prepare_track_tick(select - 1);
         } else {
-            set_radar_width(self.scan_fov);
-            if self.check_behind {
-                self.check_behind = false;
-                set_radar_min_distance(
-                    radar_max_distance() + radar_max_distance() * Self::CONTACT_FUSE_PER_DIST,
-                );
-                set_radar_max_distance(*self.scan_distance_range.end());
-            } else {
-                self.scan_heading += self.scan_fov;
-                if angle_diff(self.scan_heading, self.scan_direction).abs() > self.scan_angle_max {
-                    self.scan_heading = self.scan_direction - self.scan_angle_max;
-                }
-                set_radar_heading(self.scan_heading);
-                if let Some(same_heading_track_dist) = self
-                    .tracking
-                    .iter()
-                    .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
-                    .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
-                    .map(|tc| tc.distance())
-                    .min_by_key(|d| (d * 1000.) as i64)
-                {
-                    set_radar_max_distance(self.scan_distance_range.end().min(
-                        same_heading_track_dist
-                            - same_heading_track_dist * Self::CONTACT_FUSE_PER_DIST,
-                    ));
-                    self.check_behind = true;
-                } else {
-                    set_radar_max_distance(*self.scan_distance_range.end());
-                }
-                set_radar_min_distance(*self.scan_distance_range.start());
-            }
+            self.prepare_scan_tick();
         }
+
         self.evict_contacts();
-        self.merge_contacts();
+        //self.merge_contacts();
     }
 
     fn integrate_contact(&mut self, contact: &ScanResult) {
-        if let Some(matching_contact) = self
+        if let Some((existing_track, _)) = self
             .contacts
             .iter_mut()
-            .filter(|c| {
-                c.class == contact.class
-                    && c.position().distance(contact.position)
-                        < c.distance() * Self::CONTACT_FUSE_PER_DIST
+            .filter(|c| c.class == contact.class)
+            .filter_map(|c| {
+                let (p, v, _) = c.pva();
+                let fuse_dist = (p.distance(position()) * Self::CONTACT_FUSE_PER_DIST)
+                    .max(Self::CONTACT_FUSE_MIN);
+                let pos_match = p.distance(contact.position) < fuse_dist;
+                let vel_match = v.distance(contact.velocity) < fuse_dist;
+                (pos_match && vel_match).then_some((
+                    c,
+                    p.distance(contact.position) + v.distance(contact.velocity),
+                ))
             })
-            .min_by_key(|c| (c.position().distance(contact.position) * 1000.) as i64)
+            .min_by_key(|(_, d)| (d * 1000.) as i64)
         {
-            matching_contact.update(contact);
+            existing_track.update(contact);
         } else {
             self.contacts.push(Track::new(
                 self.next_id,
@@ -933,8 +762,9 @@ impl UnifiedRadar {
                     continue;
                 }
                 if a.position().distance(b.position())
-                    < ((a.position() + b.position()) * 0.5).distance(position())
-                        * Self::CONTACT_FUSE_PER_DIST
+                    < (((a.position() + b.position()) * 0.5).distance(position())
+                        * Self::CONTACT_FUSE_PER_DIST)
+                        .max(Self::CONTACT_FUSE_MIN)
                 {
                     // TODO: actually do a proper update
                     let merged = Track {
@@ -948,8 +778,7 @@ impl UnifiedRadar {
                             p_c: (a.state.p_c + b.state.p_c) * 0.5,
                             v_c: (a.state.v_c + b.state.v_c) * 0.5,
                             a_c: (a.state.a_c + b.state.a_c) * 0.5,
-                        }, //state: (a.state + b.state) * 0.5,
-                           //state_cov: mat4_scale(&mat4_add(&a.state_cov, &b.state_cov), 0.5),
+                        },
                     };
                     let tracking_a = self.tracking.iter().any(|id| *id == a.id);
                     if let Some((idx, _)) = self
@@ -1039,8 +868,6 @@ struct Track {
     class: Class,
     last_seen: f64,
     state: TrackState,
-    //state: Vec4d,
-    //state_cov: Mat4d,
 }
 
 impl Track {
@@ -1053,34 +880,34 @@ impl Track {
                 p: pos,
                 v: vel,
                 a: Vec2::zero(),
-                p_c: Vec2::one() * 100.,
-                v_c: Vec2::one() * 100.,
-                a_c: Vec2::one() * 100.,
+                p_c: Vec2::one(),
+                v_c: Vec2::one(),
+                a_c: Vec2::one(),
             },
-            //state: Vec4d::new(pos.x, pos.y, vel.x, vel.y),
-            //state_cov: mat4_scale(&Mat4d::identity(), 2.),
         }
     }
     fn debug(&self) {
-        let predicted = self.state.predict(elapsed(self.last_seen));
-        let err = predicted.p_c.length() + predicted.v_c.length() + predicted.a_c.length();
+        let (p, v, a) = self.state.predict_pva(elapsed(self.last_seen));
         let color = class_color(self.class);
         draw_square(self.state.p, 100., color);
-        draw_diamond(predicted.p, 100., color);
-        draw_line(predicted.p, predicted.p + predicted.v, color);
-        draw_polygon(predicted.p + predicted.a, 25., 8, 0., color);
-        draw_text!(predicted.p + Vec2::new(100., 100.), color, "{}", self.id);
+        draw_diamond(p, 100., color);
+        draw_line(p, p + v, color);
+        draw_polygon(p + a, 25., 8, 0., color);
+        draw_text!(p + Vec2::new(100., 100.), color, "{}", self.id);
+    }
+    fn pva(&self) -> (Vec2, Vec2, Vec2) {
+        self.state.predict_pva(elapsed(self.last_seen))
     }
     fn position(&self) -> Vec2 {
         self.position_in(0.)
     }
     fn position_in(&self, time: f64) -> Vec2 {
-        let predicted = self.state.predict(elapsed(self.last_seen) + time);
-        predicted.p
+        let (p, _, _) = self.state.predict_pva(elapsed(self.last_seen) + time);
+        p
     }
     fn velocity(&self) -> Vec2 {
-        let predicted = self.state.predict(elapsed(self.last_seen));
-        predicted.v
+        let (_, v, _) = self.state.predict_pva(elapsed(self.last_seen));
+        v
     }
     fn closing_speed(&self) -> f64 {
         let dir = self.direction();
@@ -1102,10 +929,9 @@ impl Track {
             .predict(elapsed(self.last_seen) + 2. * TICK_LENGTH);
         let err = predicted.p_c.length() + predicted.v_c.length() + predicted.a_c.length();
         let towards = predicted.p - position();
-        (towards.angle(), 100. * err, towards.length())
+        (towards.angle(), 150. * err, towards.length())
     }
     fn projectile_impact_time(&self, projectile_speed: f64) -> f64 {
-        let dir = self.direction();
         let time = self.distance() / (self.closing_speed() + projectile_speed);
 
         let rel_vel_pos = self.position_in(time) - velocity() * time;
@@ -1172,134 +998,9 @@ impl Track {
     }
     fn update(&mut self, observ: &ScanResult) {
         self.state.update(observ, elapsed(self.last_seen));
-        //let observ = Vec4d::new(
-        //    scan.position.x,
-        //    scan.position.y,
-        //    scan.velocity.x,
-        //    scan.velocity.y,
-        //);
-        //update(
-        //    &mut self.state,
-        //    &mut self.state_cov,
-        //    &observ,
-        //    elapsed(self.last_seen),
-        //    scan.snr,
-        //    scan.rssi,
-        //);
         self.class = observ.class;
         self.last_seen = current_time();
     }
-}
-
-fn predict(state: &Vec4d, state_cov: &Mat4d, time: f64) -> (Vec4d, Mat4d) {
-    let stm = state_transition_model(time);
-    let p_state = Vec4d::new(
-        state.x + state.z * time,
-        state.y + state.w * time,
-        state.z,
-        state.w,
-    );
-    let mut p_state_cov = (stm * state_cov) * stm.transpose();
-    p_state_cov.set(0, 0, p_state_cov.at(0, 0) + 0.5 * time);
-    p_state_cov.set(1, 1, p_state_cov.at(1, 1) + 0.5 * time);
-    p_state_cov.set(2, 2, p_state_cov.at(2, 2) + time);
-    p_state_cov.set(3, 3, p_state_cov.at(3, 3) + time);
-    (p_state, p_state_cov)
-}
-
-fn update(
-    state: &mut Vec4d,
-    state_cov: &mut Mat4d,
-    observ: &Vec4d,
-    time: f64,
-    snr: f64,
-    rssi: f64,
-) {
-    let observ_noise_cov = observation_noise_cov(snr, rssi);
-    let (p_state, p_state_cov) = predict(state, state_cov, time);
-    let innovation = observ - p_state;
-    let mut innovation_cov = observ_noise_cov;
-    mat4_add_assign(&mut innovation_cov, &p_state_cov);
-    let opt_gain = p_state_cov * innovation_cov.inverse();
-
-    *state = p_state + opt_gain * innovation;
-    *state_cov = mat4_sub(&Mat4d::identity(), &opt_gain) * p_state_cov;
-}
-
-fn state_transition_model(time: f64) -> Mat4d {
-    let t = time;
-    Mat4d {
-        m: [
-            1., 0., t, 0., // pos x
-            0., 1., 0., t, // pos y
-            0., 0., 1., 0., // vel x
-            0., 0., 0., 1., // vel y
-        ],
-    }
-}
-
-fn observation_noise_cov(snr: f64, rssi: f64) -> Mat4d {
-    let x = 0.5 * snr.recip() * -rssi;
-    debug!("snr: {}, rssi: {}, x: {}", snr, rssi, x);
-
-    Mat4d {
-        m: [
-            x, 0., 0., 0., // pos x
-            0., x, 0., 0., // pos y
-            0., 0., x, 0., // vel x
-            0., 0., 0., x, // vel y
-        ],
-    }
-}
-fn state_noise_cov(time: f64) -> Mat4d {
-    let t = time;
-    Mat4d {
-        m: [
-            0.5 * t * t,
-            0.,
-            0.,
-            0., // pos x
-            0.,
-            0.5 * t * t,
-            0.,
-            0., // pos y
-            0.,
-            0.,
-            t,
-            0., // vel x
-            0.,
-            0.,
-            0.,
-            t, // vel y
-        ],
-    }
-}
-
-fn mat4_add(lhs: &Mat4d, rhs: &Mat4d) -> Mat4d {
-    let mut m = [0.; 16];
-    lhs.m
-        .iter()
-        .zip(&rhs.m)
-        .zip(&mut m)
-        .for_each(|((l, r), m)| *m = l + r);
-    Mat4d { m }
-}
-fn mat4_add_assign(lhs: &mut Mat4d, rhs: &Mat4d) {
-    lhs.m.iter_mut().zip(&rhs.m).for_each(|(l, r)| *l += r);
-}
-fn mat4_sub(lhs: &Mat4d, rhs: &Mat4d) -> Mat4d {
-    let mut m = [0.; 16];
-    lhs.m
-        .iter()
-        .zip(&rhs.m)
-        .zip(&mut m)
-        .for_each(|((l, r), m)| *m = l - r);
-    Mat4d { m }
-}
-fn mat4_scale(lhs: &Mat4d, rhs: f64) -> Mat4d {
-    let mut m = [0.; 16];
-    lhs.m.iter().zip(&mut m).for_each(|(l, m)| *m = l * rhs);
-    Mat4d { m }
 }
 
 #[derive(Clone)]
@@ -1313,6 +1014,14 @@ struct TrackState {
 }
 
 impl TrackState {
+    fn predict_pva(&self, time: f64) -> (Vec2, Vec2, Vec2) {
+        let t = time;
+        (
+            self.p + self.v * t + self.a * t.powi(2) * 0.5,
+            self.v + self.a * t,
+            self.a,
+        )
+    }
     fn predict(&self, time: f64) -> Self {
         let t = time;
         let p_noise = Vec2::from((1. / 6.) * t.powi(3));

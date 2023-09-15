@@ -3,7 +3,7 @@ use oort_api::prelude::{
     maths_rs::{prelude::Base, Vec2f},
     *,
 };
-use std::{f64::consts::SQRT_2, io::Cursor, ops::RangeInclusive};
+use std::{collections::VecDeque, f64::consts::SQRT_2, io::Cursor, ops::RangeInclusive};
 
 const BULLET_SPEED: f64 = 1000.0; // m/s
 
@@ -132,7 +132,6 @@ impl Missile {
             }
             self.radar.track = Some(c);
             self.explode_dist = 25.;
-            deactivate_ability(Ability::ShapedCharge);
         }
     }
 
@@ -161,8 +160,7 @@ impl Missile {
                 msg.target.uncertanty.into(),
             ));
         }
-        self.explode_dist = 250.;
-        activate_ability(Ability::ShapedCharge);
+        self.explode_dist = 200.;
     }
 
     fn receive_missile_init(&mut self, msg: MissileInit) {
@@ -330,11 +328,9 @@ impl Missile {
             activate_ability(Ability::Boost);
         }
         turn(10. * angle_diff(heading(), acc.angle()));
-        if fuel() > 10. {
-            accelerate(acc);
-        } else {
-            deactivate_ability(Ability::Boost);
-            accelerate(Vec2::zero());
+        accelerate(acc);
+        if fuel() < 10. {
+            turn(50. * angle_diff(heading(), impact_dir.angle()));
         }
         debug!("tti {:.3}", tti);
         debug!("side_vel {:.3}", side_vel.length());
@@ -575,6 +571,34 @@ impl Fighter {
             0xFFFF_FFFF,
         );
         self.radar.tick();
+
+        //for danger_missile in self
+        //    .radar
+        //    .contacts
+        //    .iter()
+        //    .filter(|c| c.class == Class::Missile && c.priority() > 0.5)
+        //{
+        //    // Dangerous Missile
+        //}
+
+        //if let Some(track) = self.radar.prio_track() {
+        //let lead_heading = track.projectile_lead_heading(BULLET_SPEED);
+        //let spread_angle = 0.0025 * TAU;
+        //let spread_ticks = 30;
+
+        //let mut spread_deflection =
+        //    (current_tick() % spread_ticks - spread_ticks / 2) as f64 * spread_angle;
+        //if (current_tick() / spread_ticks) % 2 == 0 {
+        //    spread_deflection *= -1.;
+        //}
+
+        //let lead_torque = self.aimbot.aim_torque(lead_heading + spread_deflection);
+        //torque(lead_torque);
+        //if angle_diff(heading(), lead_heading) < 0.01 * TAU {
+        //    fire(0);
+        //}
+        //}
+
         for c in self.radar.contacts.clone() {
             if c.class == Class::Fighter && rand(0., 30.) < 1. {
                 let (p, v, _) = c.pva_in(TICK_LENGTH);
@@ -677,6 +701,12 @@ impl LockingRadar {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadarScanOp {
+    Search,
+    Track(u32),
+}
+
 struct UnifiedRadar {
     next_id: u32,
     scan_heading: f64,
@@ -685,13 +715,15 @@ struct UnifiedRadar {
     scan_angle_max: f64,
     scan_fov: f64,
     contacts: Vec<Track>,
-    tracking: Vec<u32>,
+    queue: Vec<RadarScanOp>,
     check_behind: bool,
 }
 
 impl UnifiedRadar {
     const CONTACT_FUSE_PER_DIST: f64 = 0.1;
     const CONTACT_FUSE_MIN: f64 = 50.;
+    const SLOTS_PER_PRIO: f64 = 4.;
+    const SEARCH_SLOTS_PER_LEN: f64 = 0.2;
 
     fn new(
         scan_distance_range: RangeInclusive<f64>,
@@ -707,7 +739,7 @@ impl UnifiedRadar {
             scan_angle_max,
             scan_fov,
             contacts: Vec::new(),
-            tracking: Vec::new(),
+            queue: vec![RadarScanOp::Search],
             check_behind: false,
         }
     }
@@ -715,16 +747,18 @@ impl UnifiedRadar {
     fn evict_contacts(&mut self) {
         self.contacts
             .retain(|c| elapsed(c.last_seen) <= class_timeout(c.class));
-        self.tracking
-            .retain(|id| self.contacts.iter().any(|c| c.id == *id));
+        self.queue.retain(|op| {
+            if *op == RadarScanOp::Search {
+                return true;
+            }
+            self.contacts
+                .iter()
+                .any(|c| matches!(op, RadarScanOp::Track(id) if *id == c.id))
+        });
     }
 
-    fn prepare_track_tick(&mut self, track_idx: usize) {
-        let track = self
-            .contacts
-            .iter()
-            .find(|c| c.id == self.tracking[track_idx])
-            .unwrap();
+    fn prepare_track_tick(&mut self, id: u32) {
+        let track = self.contacts.iter().find(|c| c.id == id).unwrap();
 
         let (h, a, d) = track.radar_track_look();
         let w = a / d;
@@ -733,7 +767,7 @@ impl UnifiedRadar {
         set_radar_min_distance(d - 0.5 * a);
         set_radar_max_distance(d + 0.5 * a);
     }
-    fn prepare_scan_tick(&mut self) {
+    fn prepare_search_tick(&mut self) {
         set_radar_width(self.scan_fov);
         if self.check_behind {
             self.check_behind = false;
@@ -749,8 +783,12 @@ impl UnifiedRadar {
             }
             set_radar_heading(self.scan_heading);
             if let Some(same_heading_track_dist) = self
-                .tracking
+                .queue
                 .iter()
+                .filter_map(|op| match op {
+                    RadarScanOp::Search => None,
+                    RadarScanOp::Track(id) => Some(id),
+                })
                 .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
                 .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
                 .map(|tc| tc.distance())
@@ -768,15 +806,20 @@ impl UnifiedRadar {
     }
 
     fn tick(&mut self) {
+        debug!("{:?}", self.queue);
         if let Some(contact) = scan() {
             self.integrate_contact(&contact);
         }
 
-        let select = current_tick() as usize % (self.tracking.len() + 1);
-        if select > 0 {
-            self.prepare_track_tick(select - 1);
-        } else {
-            self.prepare_scan_tick();
+        let queue_idx = current_tick() as usize % self.queue.len();
+        if queue_idx == 0 {
+            self.reprioritize_queue();
+        }
+
+        let op = &self.queue[queue_idx];
+        match op {
+            RadarScanOp::Search => self.prepare_search_tick(),
+            RadarScanOp::Track(id) => self.prepare_track_tick(*id),
         }
 
         self.evict_contacts();
@@ -813,10 +856,9 @@ impl UnifiedRadar {
     }
 
     fn start_tracking(&mut self, id: u32) {
-        if self.contacts.iter().any(|c| c.id == id) {
-            self.tracking.push(id);
-            self.tracking.sort_unstable();
-            self.tracking.dedup();
+        if self.contacts.iter().any(|c| c.id == id) && !self.queue.contains(&RadarScanOp::Track(id))
+        {
+            self.queue.push(RadarScanOp::Track(id));
         }
     }
 
@@ -831,6 +873,51 @@ impl UnifiedRadar {
         self.contacts.push(contact);
         self.next_id += 1;
         self.next_id - 1
+    }
+
+    fn reprioritize_queue(&mut self) {
+        let mut tracked: Vec<_> = self
+            .contacts
+            .iter()
+            .filter(|c| self.queue.contains(&RadarScanOp::Track(c.id)))
+            .map(|c| {
+                let p = c.priority();
+                (c.id, p, (Self::SLOTS_PER_PRIO * p).ceil() as usize)
+            })
+            .collect();
+
+        tracked.sort_unstable_by_key(|(_, p, _)| (-p * 10000.) as i64);
+
+        self.queue.clear();
+        self.queue.resize(
+            tracked.iter().map(|(_, _, s)| *s).sum(),
+            RadarScanOp::Search,
+        );
+
+        for n in 1..=Self::SLOTS_PER_PRIO.ceil() as usize {
+            for (id, _, slots) in tracked.iter().filter(|(_, _, s)| *s == n) {
+                for i in 0..*slots {
+                    let idx =
+                        ((i as f64 / Self::SLOTS_PER_PRIO) * self.queue.len() as f64) as usize;
+                    if idx >= self.queue.len() {
+                        self.queue.push(RadarScanOp::Track(*id));
+                    } else {
+                        self.queue.insert(idx, RadarScanOp::Track(*id));
+                    }
+                }
+            }
+        }
+
+        self.queue.retain(|op| *op != RadarScanOp::Search);
+
+        for i in 0..=(Self::SEARCH_SLOTS_PER_LEN * self.queue.len() as f64).ceil() as usize {
+            let idx = (i as f64 / Self::SEARCH_SLOTS_PER_LEN) as usize;
+            if idx >= self.queue.len() {
+                self.queue.push(RadarScanOp::Search);
+            } else {
+                self.queue.insert(idx, RadarScanOp::Search);
+            }
+        }
     }
 }
 
@@ -889,6 +976,24 @@ fn inverse_prio(value: f64, half_point: f64) -> f64 {
     half_point / (value + half_point)
 }
 
+fn missile_priority(track: &Track) -> f64 {
+    const DEATH_DIST: f64 = 50.;
+    const DANGER_DIST: f64 = 150.;
+    const DANGER_TIME: f64 = 10.;
+    const DIST_FACTOR: f64 = 0.75;
+
+    let intercept_time = track.closest_intercept_time();
+    if intercept_time.is_sign_negative() {
+        return 0.;
+    }
+    let intercept_dist = track
+        .position_in(intercept_time)
+        .distance(position_in(intercept_time));
+
+    (1. - DIST_FACTOR) * inverse_prio(intercept_time, DANGER_TIME)
+        + DIST_FACTOR * inverse_prio((intercept_dist - DEATH_DIST).max(0.), DANGER_DIST)
+}
+
 #[derive(Clone)]
 struct Track {
     id: u32,
@@ -901,19 +1006,10 @@ impl Track {
     fn priority(&self) -> f64 {
         let time = elapsed(self.last_seen);
         let dist = self.distance();
-        let intercept_time = self.projectile_impact_time(0.);
-        let intercept_dist = self
-            .position_in(intercept_time)
-            .distance(position_in(intercept_time));
-        let m = if matches!(self.class, Class::Missile | Class::Torpedo) {
-            10.
-        } else {
-            0.1
-        };
-        class_priority(self.class)
-            + inverse_prio(dist, 5000.)
-            + inverse_prio(time, 10.)
-            + m * inverse_prio(intercept_dist, 100.) * m * inverse_prio(intercept_time, 5.).max(0.)
+        if matches!(self.class, Class::Missile | Class::Torpedo) {
+            return missile_priority(self);
+        }
+        class_priority(self.class) * inverse_prio(dist, 5000.) * inverse_prio(time, 10.)
     }
     fn from_contact(id: u32, contact: &ScanResult) -> Self {
         let noise = Vec2::from(0.5 * contact.snr.recip() * -contact.rssi);

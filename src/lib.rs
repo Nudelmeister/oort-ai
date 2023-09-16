@@ -120,18 +120,16 @@ impl Missile {
                 msg.target.vel.into(),
                 msg.target.uncertanty as f64,
             );
-            let intercept_time = c.closest_intercept_time();
-            if intercept_time < 0. {
-                return;
+            if let Some(intercept_time) = c.impact_time(0.) {
+                if c.position_in(intercept_time)
+                    .distance(position_in(intercept_time))
+                    > 50.
+                {
+                    return;
+                }
+                self.radar.track = Some(c);
+                self.explode_dist = 25.;
             }
-            if c.position_in(intercept_time)
-                .distance(position_in(intercept_time))
-                > 50.
-            {
-                return;
-            }
-            self.radar.track = Some(c);
-            self.explode_dist = 25.;
         }
     }
 
@@ -572,32 +570,45 @@ impl Fighter {
         );
         self.radar.tick();
 
-        //for danger_missile in self
-        //    .radar
-        //    .contacts
-        //    .iter()
-        //    .filter(|c| c.class == Class::Missile && c.priority() > 0.5)
-        //{
-        //    // Dangerous Missile
-        //}
+        for danger_missile in self
+            .radar
+            .contacts
+            .iter()
+            .filter(|c| c.class == Class::Missile && c.priority() > 0.5)
+        {
+            // Dangerous Missile
+        }
 
-        //if let Some(track) = self.radar.prio_track() {
-        //let lead_heading = track.projectile_lead_heading(BULLET_SPEED);
-        //let spread_angle = 0.0025 * TAU;
-        //let spread_ticks = 30;
+        if let Some(track) = self.radar.prio_track() {
+            if let Some(lead_heading) = track.projectile_lead_heading(BULLET_SPEED) {
+                if track.id != self.aim_id {
+                    self.aimbot.reset();
+                    self.aim_id = track.id;
+                }
+                let spread_angle = 0.00025 * TAU;
+                let spread_ticks = 20;
 
-        //let mut spread_deflection =
-        //    (current_tick() % spread_ticks - spread_ticks / 2) as f64 * spread_angle;
-        //if (current_tick() / spread_ticks) % 2 == 0 {
-        //    spread_deflection *= -1.;
-        //}
+                let mut spread_deflection = ((current_tick() as i64 % spread_ticks)
+                    - spread_ticks / 2) as f64
+                    * spread_angle;
+                if (current_tick() as i64 / spread_ticks) % 2 == 0 {
+                    spread_deflection *= -1.;
+                };
 
-        //let lead_torque = self.aimbot.aim_torque(lead_heading + spread_deflection);
-        //torque(lead_torque);
-        //if angle_diff(heading(), lead_heading) < 0.01 * TAU {
-        //    fire(0);
-        //}
-        //}
+                let aim = lead_heading + spread_deflection;
+                draw_line(
+                    position(),
+                    position() + vec2(1000., 0.).rotate(aim),
+                    0xFFFF_00FF,
+                );
+
+                let lead_torque = self.aimbot.aim_torque(aim);
+                torque(lead_torque);
+                if angle_diff(heading(), aim) < 0.01 * TAU {
+                    fire(0);
+                }
+            }
+        }
 
         for c in self.radar.contacts.clone() {
             if c.class == Class::Fighter && rand(0., 30.) < 1. {
@@ -618,7 +629,7 @@ impl Fighter {
             c.debug();
             self.radar.start_tracking(c.id);
             if reload_ticks(1) == 0 {
-                fire(1);
+                //fire(1);
                 send_bytes(
                     &Message::MissileInit(MissileInit {
                         missile_id: 0,
@@ -980,18 +991,17 @@ fn missile_priority(track: &Track) -> f64 {
     const DEATH_DIST: f64 = 50.;
     const DANGER_DIST: f64 = 150.;
     const DANGER_TIME: f64 = 10.;
-    const DIST_FACTOR: f64 = 0.75;
+    const DIST_FACTOR: f64 = 0.6;
 
-    let intercept_time = track.closest_intercept_time();
-    if intercept_time.is_sign_negative() {
-        return 0.;
+    if let Some(intercept_time) = track.impact_time(0.) {
+        let intercept_dist = track
+            .position_in(intercept_time)
+            .distance(position_in(intercept_time));
+        (1. - DIST_FACTOR) * inverse_prio(intercept_time, DANGER_TIME)
+            + DIST_FACTOR * inverse_prio((intercept_dist - DEATH_DIST).max(0.), DANGER_DIST)
+    } else {
+        0.
     }
-    let intercept_dist = track
-        .position_in(intercept_time)
-        .distance(position_in(intercept_time));
-
-    (1. - DIST_FACTOR) * inverse_prio(intercept_time, DANGER_TIME)
-        + DIST_FACTOR * inverse_prio((intercept_dist - DEATH_DIST).max(0.), DANGER_DIST)
 }
 
 #[derive(Clone)]
@@ -1110,70 +1120,47 @@ impl Track {
         let towards = p - position();
         (towards.angle(), 150. * self.uncertanty(), towards.length())
     }
-    fn projectile_impact_time(&self, projectile_speed: f64) -> f64 {
-        let time = self.distance() / (self.closing_speed() + projectile_speed);
+    fn impact_time(&self, extra_speed: f64) -> Option<f64> {
+        const PREC_SUB_STEPS: i32 = 10;
+        const PREC_STEPS: i32 = 1;
 
-        let rel_vel_pos = self.position_in(time) - velocity() * time;
-        let bullet_pos =
-            position() + (rel_vel_pos - position()).normalize() * projectile_speed * time;
-        let mut closest_dist = rel_vel_pos.distance(bullet_pos);
-        let mut closest_time = time;
+        let (p, v, _) = self.pva();
 
-        for i in -1..=10 {
-            let t = time + time * i as f64 / 5.;
-            let rel_vel_pos = self.position_in(t) - velocity() * t;
-            let bullet_pos =
-                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-            let dist = rel_vel_pos.distance(bullet_pos);
-            if dist < closest_dist {
-                closest_time = t;
-                closest_dist = dist;
+        let p_dir = direction_to(p);
+
+        let closing_speed = self.velocity().dot(p_dir) + v.dot(-p_dir) + extra_speed;
+        if closing_speed.is_sign_negative() {
+            return None;
+        }
+        let mut closest_dist = p.distance(position());
+        let mut closest_time = closest_dist / closing_speed;
+
+        for precision in 1..=PREC_STEPS {
+            let precision = ((PREC_SUB_STEPS) as f64).powi(precision).recip();
+            let time = closest_time;
+            for t in -PREC_SUB_STEPS..=PREC_SUB_STEPS {
+                if t == 0 {
+                    continue;
+                }
+                let t = time + precision * time * t as f64;
+                let track_pos = self.position_in(t);
+                let track_dir = direction_to(track_pos);
+                let ship_pos = position_in(t) + track_dir * extra_speed * t;
+                let d = track_pos.distance(ship_pos);
+                draw_diamond(ship_pos, precision * 10000., 0xFFFF_FFFF);
+                draw_diamond(track_pos, precision * 10000., 0xFFFF_0000);
+                if d < closest_dist {
+                    closest_dist = d;
+                    closest_time = t;
+                }
             }
         }
-        let time = closest_time;
-        for i in -5..=5 {
-            let t = time + time * i as f64 / 50.;
-            let rel_vel_pos = self.position_in(t) - velocity() * t;
-            let bullet_pos =
-                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-            let dist = rel_vel_pos.distance(bullet_pos);
-            if dist < closest_dist {
-                closest_time = t;
-                closest_dist = dist;
-            }
-        }
-        let time = closest_time;
-        for i in -5..=5 {
-            let t = time + time * i as f64 / 500.;
-            let rel_vel_pos = self.position_in(t) - velocity() * t;
-            let bullet_pos =
-                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-            let dist = rel_vel_pos.distance(bullet_pos);
-            if dist < closest_dist {
-                closest_time = t;
-                closest_dist = dist;
-            }
-        }
-        let time = closest_time;
-        for i in -5..=5 {
-            let t = time + time * i as f64 / 5000.;
-            let rel_vel_pos = self.position_in(t) - velocity() * t;
-            let bullet_pos =
-                position() + (rel_vel_pos - position()).normalize() * projectile_speed * t;
-            let dist = rel_vel_pos.distance(bullet_pos);
-            if dist < closest_dist {
-                closest_time = t;
-                closest_dist = dist;
-            }
-        }
-        closest_time
+
+        closest_time.is_sign_positive().then_some(closest_time)
     }
-    fn closest_intercept_time(&self) -> f64 {
-        self.projectile_impact_time(0.)
-    }
-    fn projectile_lead_heading(&self, projectile_speed: f64) -> f64 {
-        let t = self.projectile_impact_time(projectile_speed);
-        ((self.position_in(t) - velocity() * t) - position()).angle()
+    fn projectile_lead_heading(&self, projectile_speed: f64) -> Option<f64> {
+        self.impact_time(projectile_speed)
+            .map(|t| ((self.position_in(t) - velocity() * t) - position()).angle())
     }
     fn update(&mut self, observ: &ScanResult) {
         self.state.update(observ, elapsed(self.last_seen));
@@ -1190,6 +1177,9 @@ impl Track {
         let (p_c, v_c, a_c) = self.state.predict_cov(elapsed(self.last_seen));
         p_c.length() + v_c.length() + a_c.length()
     }
+}
+fn direction_to(pos: Vec2) -> Vec2 {
+    (pos - position()).normalize()
 }
 
 #[derive(Clone)]

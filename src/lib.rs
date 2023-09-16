@@ -3,9 +3,10 @@ use oort_api::prelude::{
     maths_rs::{prelude::Base, Vec2f},
     *,
 };
-use std::{collections::VecDeque, f64::consts::SQRT_2, io::Cursor, ops::RangeInclusive};
+use std::{f64::consts::SQRT_2, io::Cursor, ops::RangeInclusive};
 
 const BULLET_SPEED: f64 = 1000.0; // m/s
+const BULLET_RANGE: f64 = 10000.0; // m
 
 pub enum Ship {
     Fighter(Fighter),
@@ -585,7 +586,7 @@ impl Fighter {
                     self.aimbot.reset();
                     self.aim_id = track.id;
                 }
-                let spread_angle = 0.00025 * TAU;
+                let spread_angle = 0.0001 * TAU;
                 let spread_ticks = 20;
 
                 let mut spread_deflection = ((current_tick() as i64 % spread_ticks)
@@ -604,7 +605,7 @@ impl Fighter {
 
                 let lead_torque = self.aimbot.aim_torque(aim);
                 torque(lead_torque);
-                if angle_diff(heading(), aim) < 0.01 * TAU {
+                if angle_diff(heading(), aim) < 0.01 * TAU && track.distance() < BULLET_RANGE {
                     fire(0);
                 }
             }
@@ -712,12 +713,6 @@ impl LockingRadar {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RadarScanOp {
-    Search,
-    Track(u32),
-}
-
 struct UnifiedRadar {
     next_id: u32,
     scan_heading: f64,
@@ -726,7 +721,7 @@ struct UnifiedRadar {
     scan_angle_max: f64,
     scan_fov: f64,
     contacts: Vec<Track>,
-    queue: Vec<RadarScanOp>,
+    tracking: Vec<u32>,
     check_behind: bool,
 }
 
@@ -750,7 +745,7 @@ impl UnifiedRadar {
             scan_angle_max,
             scan_fov,
             contacts: Vec::new(),
-            queue: vec![RadarScanOp::Search],
+            tracking: Vec::new(),
             check_behind: false,
         }
     }
@@ -758,18 +753,16 @@ impl UnifiedRadar {
     fn evict_contacts(&mut self) {
         self.contacts
             .retain(|c| elapsed(c.last_seen) <= class_timeout(c.class));
-        self.queue.retain(|op| {
-            if *op == RadarScanOp::Search {
-                return true;
-            }
-            self.contacts
-                .iter()
-                .any(|c| matches!(op, RadarScanOp::Track(id) if *id == c.id))
-        });
+        self.tracking
+            .retain(|id| self.contacts.iter().any(|c| *id == c.id));
     }
 
-    fn prepare_track_tick(&mut self, id: u32) {
-        let track = self.contacts.iter().find(|c| c.id == id).unwrap();
+    fn prepare_track_tick(&mut self, idx: usize) {
+        let track = self
+            .contacts
+            .iter()
+            .find(|c| c.id == self.tracking[idx])
+            .unwrap();
 
         let (h, a, d) = track.radar_track_look();
         let w = a / d;
@@ -794,12 +787,8 @@ impl UnifiedRadar {
             }
             set_radar_heading(self.scan_heading);
             if let Some(same_heading_track_dist) = self
-                .queue
+                .tracking
                 .iter()
-                .filter_map(|op| match op {
-                    RadarScanOp::Search => None,
-                    RadarScanOp::Track(id) => Some(id),
-                })
                 .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
                 .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
                 .map(|tc| tc.distance())
@@ -817,20 +806,16 @@ impl UnifiedRadar {
     }
 
     fn tick(&mut self) {
-        debug!("{:?}", self.queue);
+        debug!("{:?}", self.tracking);
         if let Some(contact) = scan() {
             self.integrate_contact(&contact);
         }
 
-        let queue_idx = current_tick() as usize % self.queue.len();
-        if queue_idx == 0 {
-            self.reprioritize_queue();
-        }
-
-        let op = &self.queue[queue_idx];
-        match op {
-            RadarScanOp::Search => self.prepare_search_tick(),
-            RadarScanOp::Track(id) => self.prepare_track_tick(*id),
+        let select = current_tick() as usize % (self.tracking.len() + 1);
+        if select > 0 {
+            self.prepare_track_tick(select - 1);
+        } else {
+            self.prepare_search_tick();
         }
 
         self.evict_contacts();
@@ -867,9 +852,8 @@ impl UnifiedRadar {
     }
 
     fn start_tracking(&mut self, id: u32) {
-        if self.contacts.iter().any(|c| c.id == id) && !self.queue.contains(&RadarScanOp::Track(id))
-        {
-            self.queue.push(RadarScanOp::Track(id));
+        if self.contacts.iter().any(|c| c.id == id) && !self.tracking.contains(&id) {
+            self.tracking.push(id);
         }
     }
 
@@ -884,51 +868,6 @@ impl UnifiedRadar {
         self.contacts.push(contact);
         self.next_id += 1;
         self.next_id - 1
-    }
-
-    fn reprioritize_queue(&mut self) {
-        let mut tracked: Vec<_> = self
-            .contacts
-            .iter()
-            .filter(|c| self.queue.contains(&RadarScanOp::Track(c.id)))
-            .map(|c| {
-                let p = c.priority();
-                (c.id, p, (Self::SLOTS_PER_PRIO * p).ceil() as usize)
-            })
-            .collect();
-
-        tracked.sort_unstable_by_key(|(_, p, _)| (-p * 10000.) as i64);
-
-        self.queue.clear();
-        self.queue.resize(
-            tracked.iter().map(|(_, _, s)| *s).sum(),
-            RadarScanOp::Search,
-        );
-
-        for n in 1..=Self::SLOTS_PER_PRIO.ceil() as usize {
-            for (id, _, slots) in tracked.iter().filter(|(_, _, s)| *s == n) {
-                for i in 0..*slots {
-                    let idx =
-                        ((i as f64 / Self::SLOTS_PER_PRIO) * self.queue.len() as f64) as usize;
-                    if idx >= self.queue.len() {
-                        self.queue.push(RadarScanOp::Track(*id));
-                    } else {
-                        self.queue.insert(idx, RadarScanOp::Track(*id));
-                    }
-                }
-            }
-        }
-
-        self.queue.retain(|op| *op != RadarScanOp::Search);
-
-        for i in 0..=(Self::SEARCH_SLOTS_PER_LEN * self.queue.len() as f64).ceil() as usize {
-            let idx = (i as f64 / Self::SEARCH_SLOTS_PER_LEN) as usize;
-            if idx >= self.queue.len() {
-                self.queue.push(RadarScanOp::Search);
-            } else {
-                self.queue.insert(idx, RadarScanOp::Search);
-            }
-        }
     }
 }
 
@@ -1122,22 +1061,26 @@ impl Track {
     }
     fn impact_time(&self, extra_speed: f64) -> Option<f64> {
         const PREC_SUB_STEPS: i32 = 10;
-        const PREC_STEPS: i32 = 1;
+        const PREC_STEPS: i32 = 4;
 
         let (p, v, _) = self.pva();
 
         let p_dir = direction_to(p);
 
-        let closing_speed = self.velocity().dot(p_dir) + v.dot(-p_dir) + extra_speed;
+        let closing_speed = velocity().dot(p_dir) + v.dot(-p_dir) + extra_speed;
         if closing_speed.is_sign_negative() {
             return None;
         }
-        let mut closest_dist = p.distance(position());
-        let mut closest_time = closest_dist / closing_speed;
+        let mut closest_time = p.distance(position()) / closing_speed;
+        let track_pos = self.position_in(closest_time);
+        let track_dir = direction_to(track_pos);
+        let ship_pos = position_in(closest_time) + track_dir * extra_speed * closest_time;
+        let mut closest_dist = track_pos.distance(ship_pos);
 
         for precision in 1..=PREC_STEPS {
-            let precision = ((PREC_SUB_STEPS) as f64).powi(precision).recip();
+            let precision = ((PREC_SUB_STEPS + 1) as f64).powi(precision).recip();
             let time = closest_time;
+            let mut last_d = f64::MAX;
             for t in -PREC_SUB_STEPS..=PREC_SUB_STEPS {
                 if t == 0 {
                     continue;
@@ -1147,9 +1090,13 @@ impl Track {
                 let track_dir = direction_to(track_pos);
                 let ship_pos = position_in(t) + track_dir * extra_speed * t;
                 let d = track_pos.distance(ship_pos);
-                draw_diamond(ship_pos, precision * 10000., 0xFFFF_FFFF);
-                draw_diamond(track_pos, precision * 10000., 0xFFFF_0000);
+                if last_d < d {
+                    break;
+                }
+                last_d = d;
                 if d < closest_dist {
+                    //draw_diamond(ship_pos, precision * 10000., 0xFFFF_FFFF);
+                    //draw_diamond(track_pos, precision * 10000., 0xFFFF_0000);
                     closest_dist = d;
                     closest_time = t;
                 }

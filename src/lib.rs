@@ -3,10 +3,10 @@ use oort_api::prelude::{
     maths_rs::{prelude::Base, Vec2f},
     *,
 };
-use std::{f64::consts::SQRT_2, io::Cursor, ops::RangeInclusive};
+use std::{collections::VecDeque, f64::consts::SQRT_2, io::Cursor, ops::RangeInclusive};
 
-const BULLET_SPEED: f64 = 1000.0; // m/s
-const BULLET_RANGE: f64 = 10000.0; // m
+const BULLET_SPEED: f64 = 1000.;
+const BULLET_RANGE: f64 = 10000.;
 
 pub enum Ship {
     Fighter(Fighter),
@@ -107,7 +107,6 @@ impl Missile {
     fn receive_potential_target(&mut self, msg: TargetUpdate) {
         if msg
             .missile_id
-            .get()
             .zip(self.id)
             .map_or(true, |(m_id, s_id)| m_id == s_id)
         {
@@ -137,7 +136,6 @@ impl Missile {
     fn receive_target_update(&mut self, msg: TargetUpdate) {
         if msg
             .missile_id
-            .get()
             .zip(self.id)
             .map_or(false, |(m_id, s_id)| m_id != s_id)
         {
@@ -193,9 +191,10 @@ impl Missile {
             draw_triangle(position(), 1000., 0xFFA0_A0FF);
         } else if rand(0., 50.) < 1. {
             let message = Message::TargetUpdate(TargetUpdate {
-                missile_id: PackedOptionU16::make(None),
+                missile_id: None,
                 target: TargetMsg {
                     class: track.class,
+                    send_tick: current_tick(),
                     uncertanty: track.uncertanty() as f32,
                     pos: track.position().into(),
                     vel: track.velocity().into(),
@@ -398,22 +397,6 @@ impl Message {
 }
 
 #[derive(Clone, Copy)]
-struct PackedOptionU16(u16);
-impl PackedOptionU16 {
-    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
-        Some(Self(data.read_u16::<NetworkEndian>().ok()?))
-    }
-    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        let _ = data.write_u16::<NetworkEndian>(self.0);
-    }
-    fn get(self) -> Option<u16> {
-        (self.0 != u16::MAX).then_some(self.0)
-    }
-    fn make(value: Option<u16>) -> Self {
-        Self(value.unwrap_or(u16::MAX))
-    }
-}
-#[derive(Clone, Copy)]
 struct PairTti {
     sender_missile_id: u16,
     time_to_impact: f32,
@@ -471,17 +454,18 @@ impl MissileInit {
 }
 #[derive(Clone, Copy)]
 struct TargetUpdate {
-    missile_id: PackedOptionU16,
+    missile_id: Option<u16>,
     target: TargetMsg,
 }
 impl TargetUpdate {
     fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
-        let missile_id = PackedOptionU16::from_bytes(data)?;
+        let missile_id = data.read_u16::<NetworkEndian>().ok()?;
+        let missile_id = (missile_id != u16::MAX).then_some(missile_id);
         let target = TargetMsg::from_bytes(data)?;
         Some(Self { missile_id, target })
     }
     fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        self.missile_id.to_bytes(data);
+        let _ = data.write_u16::<NetworkEndian>(self.missile_id.unwrap_or(u16::MAX));
         self.target.to_bytes(data);
     }
 }
@@ -489,6 +473,7 @@ impl TargetUpdate {
 #[derive(Clone, Copy)]
 struct TargetMsg {
     class: Class,
+    send_tick: u32,
     uncertanty: f32,
     pos: Vec2f,
     vel: Vec2f,
@@ -507,6 +492,7 @@ impl TargetMsg {
             _ => return None,
         };
 
+        let send_tick = data.read_u32::<NetworkEndian>().ok()?;
         let uncertanty = data.read_f32::<NetworkEndian>().ok()?;
 
         let px = data.read_f32::<NetworkEndian>().ok()?;
@@ -516,6 +502,7 @@ impl TargetMsg {
 
         Some(Self {
             class,
+            send_tick,
             uncertanty,
             pos: Vec2f::new(px, py),
             vel: Vec2f::new(vx, vy),
@@ -532,6 +519,7 @@ impl TargetMsg {
             Class::Torpedo => 6,
             Class::Unknown => 7,
         });
+        let _ = data.write_u32::<NetworkEndian>(self.send_tick);
         let _ = data.write_f32::<NetworkEndian>(self.uncertanty);
         let _ = data.write_f32::<NetworkEndian>(self.pos.x);
         let _ = data.write_f32::<NetworkEndian>(self.pos.y);
@@ -545,6 +533,7 @@ pub struct Fighter {
     aimbot: AimBot,
     aim_id: u32,
     next_missile_id: u16,
+    send_queue: VecDeque<Message>,
 }
 
 impl Default for Fighter {
@@ -556,10 +545,11 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            radar: UnifiedRadar::new(0.0..=40_000., 0., TAU, TAU * TICK_LENGTH * 2.),
+            radar: UnifiedRadar::new(0.0..=40_000., 0., TAU, TAU * TICK_LENGTH * 4., true),
             aimbot: AimBot::new(70., -70_000.),
             aim_id: 0,
             next_missile_id: 0,
+            send_queue: VecDeque::new(),
         }
     }
 
@@ -571,22 +561,13 @@ impl Fighter {
         );
         self.radar.tick();
 
-        for danger_missile in self
-            .radar
-            .contacts
-            .iter()
-            .filter(|c| c.class == Class::Missile && c.priority() > 0.5)
-        {
-            // Dangerous Missile
-        }
-
         if let Some(track) = self.radar.prio_track() {
             if let Some(lead_heading) = track.projectile_lead_heading(BULLET_SPEED) {
                 if track.id != self.aim_id {
                     self.aimbot.reset();
                     self.aim_id = track.id;
                 }
-                let spread_angle = 0.0001 * TAU;
+                let spread_angle = 0.00015 * TAU;
                 let spread_ticks = 20;
 
                 let mut spread_deflection = ((current_tick() as i64 % spread_ticks)
@@ -611,38 +592,52 @@ impl Fighter {
             }
         }
 
-        for c in self.radar.contacts.clone() {
-            if c.class == Class::Fighter && rand(0., 30.) < 1. {
-                let (p, v, _) = c.pva_in(TICK_LENGTH);
-                send_bytes(
-                    &Message::TargetUpdate(TargetUpdate {
-                        missile_id: PackedOptionU16::make(None),
-                        target: TargetMsg {
-                            class: c.class,
-                            uncertanty: c.uncertanty() as f32,
-                            pos: p.into(),
-                            vel: v.into(),
-                        },
-                    })
-                    .to_bytes(),
-                );
+        if let Some(t) = self
+            .radar
+            .contacts
+            .iter()
+            .filter(|c| !matches!(c.class, Class::Asteroid | Class::Missile | Class::Torpedo))
+            .max_by_key(|c| (c.priority() * 100000.) as i64)
+        {
+            // Priority Not Gun Target
+            if !self
+                .send_queue
+                .iter()
+                .any(|m| matches!(m, Message::TargetUpdate(_)))
+            {
+                let (p, v, _) = t.pva();
+                let message = Message::TargetUpdate(TargetUpdate {
+                    missile_id: None,
+                    target: TargetMsg {
+                        class: t.class,
+                        send_tick: current_tick(),
+                        uncertanty: t.uncertanty() as f32,
+                        pos: p.into(),
+                        vel: v.into(),
+                    },
+                });
+                self.send_queue.push_back(message);
             }
-            c.debug();
-            self.radar.start_tracking(c.id);
             if reload_ticks(1) == 0 {
-                //fire(1);
-                send_bytes(
-                    &Message::MissileInit(MissileInit {
-                        missile_id: 0,
-                        target: TargetMsg {
-                            class: c.class,
-                            uncertanty: c.uncertanty() as f32,
-                            pos: c.position().into(),
-                            vel: c.velocity().into(),
-                        },
-                    })
-                    .to_bytes(),
-                )
+                fire(1);
+                let message = Message::MissileInit(MissileInit {
+                    missile_id: self.next_missile_id,
+                    target: TargetMsg {
+                        class: t.class,
+                        send_tick: current_tick(),
+                        uncertanty: t.uncertanty() as f32,
+                        pos: t.position().into(),
+                        vel: t.velocity().into(),
+                    },
+                });
+                self.send_queue.push_front(message);
+                self.next_missile_id += 1;
+            }
+        }
+
+        if rand(0., 1.) < 0.25 {
+            if let Some(m) = self.send_queue.pop_front() {
+                send_bytes(&m.to_bytes());
             }
         }
     }
@@ -723,19 +718,19 @@ struct UnifiedRadar {
     contacts: Vec<Track>,
     tracking: Vec<u32>,
     check_behind: bool,
+    track_all: bool,
 }
 
 impl UnifiedRadar {
     const CONTACT_FUSE_PER_DIST: f64 = 0.1;
     const CONTACT_FUSE_MIN: f64 = 50.;
-    const SLOTS_PER_PRIO: f64 = 4.;
-    const SEARCH_SLOTS_PER_LEN: f64 = 0.2;
 
     fn new(
         scan_distance_range: RangeInclusive<f64>,
         scan_direction: f64,
         scan_angle_max: f64,
         scan_fov: f64,
+        track_all: bool,
     ) -> Self {
         Self {
             next_id: 0,
@@ -747,6 +742,7 @@ impl UnifiedRadar {
             contacts: Vec::new(),
             tracking: Vec::new(),
             check_behind: false,
+            track_all,
         }
     }
 
@@ -807,6 +803,9 @@ impl UnifiedRadar {
 
     fn tick(&mut self) {
         debug!("{:?}", self.tracking);
+        for c in &self.contacts {
+            c.debug();
+        }
         if let Some(contact) = scan() {
             self.integrate_contact(&contact);
         }
@@ -847,6 +846,9 @@ impl UnifiedRadar {
                 contact.position,
                 contact.velocity,
             ));
+            if self.track_all {
+                self.start_tracking(self.next_id);
+            }
             self.next_id += 1;
         }
     }

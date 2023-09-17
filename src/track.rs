@@ -218,10 +218,10 @@ impl Track {
         self.class = observ.class;
         self.last_seen = current_time();
     }
-    pub fn update_fixed_noise(&mut self, pos: Vec2, vel: Vec2, noise: f64) {
+    pub fn update_fixed_noise(&mut self, pos: Vec2, vel: Vec2, noise: f64, last_seen: f64) {
         self.state
             .update_fixed_noise(pos, vel, noise, elapsed(self.last_seen));
-        self.last_seen = current_time();
+        self.last_seen = self.last_seen.max(last_seen);
     }
 
     pub fn uncertanty(&self) -> f64 {

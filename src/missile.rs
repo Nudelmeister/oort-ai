@@ -1,10 +1,18 @@
 use super::{
+    elapsed,
     message::{MissileInit, MyMessage, Pair, PairTti, TargetMsg, TargetUpdate},
     position_in,
     radar::LockingRadar,
     track::Track,
 };
 use oort_api::prelude::{maths_rs::prelude::Base, *};
+
+const SHRAPNEl_MAX_RANGE: f64 = 300.;
+const SHRAPNEl_OPT_RANGE: f64 = 100.;
+const SHRAPNEl_SPEED: f64 = 300. / (10. * TICK_LENGTH);
+
+const SHRAPNEL_OPT_TTI: f64 = SHRAPNEl_OPT_RANGE / SHRAPNEl_SPEED;
+const SHRAPNEL_MAX_TTI: f64 = SHRAPNEl_MAX_RANGE / SHRAPNEl_SPEED;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissileStage {
@@ -114,22 +122,35 @@ impl Missile {
             return;
         }
 
+        if elapsed(msg.target.send_time as f64) > 0.1 {
+            return;
+        }
+
+        draw_diamond(
+            (msg.target.pos + msg.target.vel * elapsed(msg.target.send_time as f64) as f32).into(),
+            1000.,
+            0xFFFF_FFFF,
+        );
+        draw_square(msg.target.pos.into(), 1000., 0xFFFF_FFFF);
+
         if let Some(track) = self.radar.track.as_mut() {
             track.update_fixed_noise(
-                msg.target.pos.into(),
+                (msg.target.pos + msg.target.vel * elapsed(msg.target.send_time as f64) as f32)
+                    .into(),
                 msg.target.vel.into(),
                 msg.target.uncertanty.into(),
+                elapsed(msg.target.send_time as f64),
             );
         } else {
             self.radar.track = Some(Track::with_uncertanty(
                 0,
                 msg.target.class,
-                msg.target.pos.into(),
+                (msg.target.pos + msg.target.vel * elapsed(msg.target.send_time as f64) as f32)
+                    .into(),
                 msg.target.vel.into(),
                 msg.target.uncertanty.into(),
             ));
         }
-        self.explode_dist = 200.;
     }
 
     fn receive_missile_init(&mut self, msg: MissileInit) {
@@ -166,7 +187,7 @@ impl Missile {
                 missile_id: None,
                 target: TargetMsg {
                     class: track.class,
-                    send_tick: current_tick(),
+                    send_time: track.last_seen as f32,
                     uncertanty: track.uncertanty() as f32,
                     pos: track.position().into(),
                     vel: track.velocity().into(),
@@ -299,17 +320,20 @@ impl Missile {
         }
         turn(10. * angle_diff(heading(), acc.angle()));
         accelerate(acc);
-        if fuel() < 10. {
-            turn(50. * angle_diff(heading(), impact_dir.angle()));
-        }
         debug!("tti {:.3}", tti);
-        debug!("side_vel {:.3}", side_vel.length());
-        debug!("side_acc {:.3}", side_acc.length());
-        debug!("to_acc {:.3}", toward_acc.length());
-        debug!("acc {:.3}", acc.length());
-        debug!("acc l {:.3}", acc_length);
 
-        if health() < 20. || tti <= TICK_LENGTH || contact.distance() < self.explode_dist {
+        let shrapnel_tti =
+            contact.distance() / (contact.closing_speed() + 0.5 * max_fuel_used + SHRAPNEl_SPEED);
+        debug!("s-tti {:.3}", shrapnel_tti);
+
+        if shrapnel_tti - SHRAPNEL_OPT_TTI < 0.25 {
+            let shrapnel_pos = contact.position_in(shrapnel_tti);
+            let shrapnel_aim = (shrapnel_pos - position()).angle();
+            draw_triangle(shrapnel_pos, 50., 0xFFFF_0000);
+            turn(50. * angle_diff(heading(), shrapnel_aim));
+        }
+
+        if health() < 20. || shrapnel_tti <= SHRAPNEL_OPT_TTI {
             explode();
         }
     }

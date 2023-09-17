@@ -7,7 +7,7 @@ use oort_api::{
 };
 use std::io::Cursor;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum MyMessage {
     MissileInit(MissileInit),
     TargetUpdate(TargetUpdate),
@@ -60,7 +60,7 @@ impl MyMessage {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PairTti {
     pub sender_missile_id: u16,
     pub time_to_impact: f32,
@@ -80,7 +80,7 @@ impl PairTti {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Pair {
     pub missile_id_a: u16,
     pub missile_id_b: u16,
@@ -100,7 +100,7 @@ impl Pair {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct MissileInit {
     pub missile_id: u16,
     pub target: TargetMsg,
@@ -116,7 +116,7 @@ impl MissileInit {
         self.target.to_bytes(data);
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct TargetUpdate {
     pub missile_id: Option<u16>,
     pub target: TargetMsg,
@@ -134,10 +134,10 @@ impl TargetUpdate {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct TargetMsg {
     pub class: Class,
-    pub send_tick: u32,
+    pub send_time: f32,
     pub uncertanty: f32,
     pub pos: Vec2f,
     pub vel: Vec2f,
@@ -156,7 +156,7 @@ impl TargetMsg {
             _ => return None,
         };
 
-        let send_tick = data.read_u32::<NetworkEndian>().ok()?;
+        let send_time = data.read_f32::<NetworkEndian>().ok()?;
         let uncertanty = data.read_f32::<NetworkEndian>().ok()?;
 
         let px = data.read_f32::<NetworkEndian>().ok()?;
@@ -166,7 +166,7 @@ impl TargetMsg {
 
         Some(Self {
             class,
-            send_tick,
+            send_time,
             uncertanty,
             pos: Vec2f::new(px, py),
             vel: Vec2f::new(vx, vy),
@@ -183,7 +183,7 @@ impl TargetMsg {
             Class::Torpedo => 6,
             Class::Unknown => 7,
         });
-        let _ = data.write_u32::<NetworkEndian>(self.send_tick);
+        let _ = data.write_f32::<NetworkEndian>(self.send_time);
         let _ = data.write_f32::<NetworkEndian>(self.uncertanty);
         let _ = data.write_f32::<NetworkEndian>(self.pos.x);
         let _ = data.write_f32::<NetworkEndian>(self.pos.y);

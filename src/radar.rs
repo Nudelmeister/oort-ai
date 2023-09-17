@@ -6,7 +6,7 @@ fn class_timeout(class: Class) -> f64 {
         Class::Frigate => 5.,
         Class::Cruiser => 10.,
         Class::Asteroid => 30.,
-        Class::Missile | Class::Torpedo => 0.25,
+        Class::Missile | Class::Torpedo => 0.5,
         Class::Target | Class::Fighter | Class::Unknown => 2.5,
     }
 }
@@ -55,8 +55,8 @@ pub struct UnifiedRadar {
     next_id: u32,
     scan_heading: f64,
     scan_distance_range: RangeInclusive<f64>,
-    scan_direction: f64,
-    scan_angle_max: f64,
+    pub scan_direction: f64,
+    pub scan_angle_max: f64,
     scan_fov: f64,
     contacts: Vec<Track>,
     tracking: Vec<u32>,

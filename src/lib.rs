@@ -1,6 +1,6 @@
-use message::{MissileInit, MyMessage, TargetMsg, TargetUpdate};
+use message::{MissileInit, MyMessage, Pair, TargetMsg, TargetUpdate};
 use missile::Missile;
-use oort_api::prelude::*;
+use oort_api::prelude::{maths_rs::prelude::Base, *};
 use radar::UnifiedRadar;
 use std::collections::VecDeque;
 
@@ -44,6 +44,7 @@ pub struct Fighter {
     aim_id: u32,
     next_missile_id: u16,
     send_queue: VecDeque<MyMessage>,
+    move_target: Vec2,
 }
 
 impl Default for Fighter {
@@ -55,11 +56,12 @@ impl Default for Fighter {
 impl Fighter {
     pub fn new() -> Fighter {
         Fighter {
-            radar: UnifiedRadar::new(0.0..=40_000., 0., TAU, TAU * TICK_LENGTH * 4., true),
+            radar: UnifiedRadar::new(0.0..=40_000., 0., TAU, TAU * TICK_LENGTH, true),
             aimbot: AimBot::new(70., -70_000.),
             aim_id: 0,
             next_missile_id: 0,
             send_queue: VecDeque::new(),
+            move_target: Vec2::zero(),
         }
     }
 
@@ -108,19 +110,24 @@ impl Fighter {
             .iter()
             .filter(|c| !matches!(c.class, Class::Asteroid | Class::Missile | Class::Torpedo))
             .max_by_key(|c| (c.priority() * 100000.) as i64)
+            .cloned()
         {
             // Priority Not Gun Target
-            if !self
-                .send_queue
-                .iter()
-                .any(|m| matches!(m, MyMessage::TargetUpdate(_)))
+            self.radar.scan_direction = t.direction().angle();
+            self.radar.scan_angle_max = 0.1 * TAU;
+
+            if current_tick() % 30 == 0
+                && !self
+                    .send_queue
+                    .iter()
+                    .any(|m| matches!(m, MyMessage::TargetUpdate(_)))
             {
                 let (p, v, _) = t.pva();
                 let message = MyMessage::TargetUpdate(TargetUpdate {
                     missile_id: None,
                     target: TargetMsg {
                         class: t.class,
-                        send_tick: current_tick(),
+                        send_time: t.last_seen as f32,
                         uncertanty: t.uncertanty() as f32,
                         pos: p.into(),
                         vel: v.into(),
@@ -134,7 +141,7 @@ impl Fighter {
                     missile_id: self.next_missile_id,
                     target: TargetMsg {
                         class: t.class,
-                        send_tick: current_tick(),
+                        send_time: t.last_seen as f32,
                         uncertanty: t.uncertanty() as f32,
                         pos: t.position().into(),
                         vel: t.velocity().into(),
@@ -142,13 +149,32 @@ impl Fighter {
                 });
                 self.send_queue.push_front(message);
                 self.next_missile_id += 1;
+                if self.next_missile_id >= 2 {
+                    self.send_queue.push_back(MyMessage::Pair(Pair {
+                        missile_id_a: self.next_missile_id - 1,
+                        missile_id_b: self.next_missile_id - 2,
+                    }));
+                }
             }
         }
 
-        if rand(0., 1.) < 0.25 {
-            if let Some(m) = self.send_queue.pop_front() {
-                send_bytes(&m.to_bytes());
-            }
+        if current_tick() % 600 == 0 {
+            self.move_target = vec2(
+                rand(-world_size(), world_size()),
+                rand(-world_size(), world_size()),
+            ) * 0.4;
+        }
+
+        let stop_pos = position_in(velocity().length() / max_lateral_acceleration());
+        if stop_pos.x.abs() >= world_size() * 0.4 || stop_pos.x.abs() >= world_size() * 0.4 {
+            accelerate(-position());
+        } else {
+            accelerate(self.move_target - position());
+            draw_triangle(self.move_target, 1000., 0xFF00_FF00);
+        }
+
+        if let Some(m) = self.send_queue.pop_front() {
+            send_bytes(&m.to_bytes());
         }
     }
 }

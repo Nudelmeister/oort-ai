@@ -1,6 +1,6 @@
 use super::{
     elapsed,
-    message::{MissileInit, MyMessage, Pair, PairTti, TargetMsg, TargetUpdate},
+    message::{Msg, MsgKind, QuantTrack},
     position_in,
     radar::LockingRadar,
     track::Track,
@@ -22,11 +22,7 @@ enum MissileStage {
 }
 
 pub struct Missile {
-    id: Option<u16>,
     radar: LockingRadar,
-    paired: Option<u16>,
-    paired_tti: Option<f64>,
-    explode_dist: f64,
     stage: MissileStage,
 }
 impl Default for Missile {
@@ -41,91 +37,26 @@ impl Missile {
 
     pub fn new() -> Self {
         Self {
-            id: None,
             radar: LockingRadar::new(),
-            paired: None,
-            paired_tti: None,
-            explode_dist: 50.,
             stage: MissileStage::Boost,
         }
     }
 
     pub fn receive(&mut self) {
-        if let Some(message) = receive_bytes().and_then(MyMessage::from_bytes) {
-            match message {
-                MyMessage::MissileInit(msg) => self.receive_missile_init(msg),
-                MyMessage::TargetUpdate(msg) => self.receive_target_update(msg),
-                MyMessage::PotentialTarget(msg) => self.receive_potential_target(msg),
-                MyMessage::Pair(msg) => self.receive_pair(msg),
-                MyMessage::PairTti(msg) => self.receive_pair_tti(msg),
-            }
-        }
-    }
-
-    fn receive_pair(&mut self, msg: Pair) {
-        let Some(my_id) = self.id else {
+        let Some(msg) = Msg::receive() else {
             return;
         };
-        if self.paired.is_some() {
-            return;
-        }
-        if msg.missile_id_a == my_id {
-            self.paired = Some(msg.missile_id_b);
-        } else if msg.missile_id_b == my_id {
-            self.paired = Some(msg.missile_id_a);
-        }
-    }
-    fn receive_pair_tti(&mut self, msg: PairTti) {
-        let Some(paired_id) = self.paired else {
-            return;
-        };
-        if msg.sender_missile_id == paired_id {
-            self.paired_tti = Some(msg.time_to_impact.into());
+
+        match msg.msg {
+            MsgKind::SenderPos(_) => (),
+            MsgKind::SenderTgt(track) => self.receive_target_update(track),
+            MsgKind::Tracks(_) => (),
+            MsgKind::SwitchChannel(channel) => set_radio_channel(channel as usize),
         }
     }
 
-    fn receive_potential_target(&mut self, msg: TargetUpdate) {
-        if msg
-            .missile_id
-            .zip(self.id)
-            .map_or(true, |(m_id, s_id)| m_id == s_id)
-        {
-            if self.paired.is_some() {
-                return;
-            }
-            let c = Track::with_uncertanty(
-                0,
-                msg.target.class,
-                msg.target.pos.into(),
-                msg.target.vel.into(),
-                msg.target.uncertanty as f64,
-            );
-            if let Some(intercept_time) = c.impact_time(0.) {
-                if c.position_in(intercept_time)
-                    .distance(position_in(intercept_time))
-                    > 50.
-                {
-                    return;
-                }
-                self.radar.track = Some(c);
-                self.explode_dist = 25.;
-            }
-        }
-    }
-
-    fn receive_target_update(&mut self, msg: TargetUpdate) {
-        if msg
-            .missile_id
-            .zip(self.id)
-            .map_or(false, |(m_id, s_id)| m_id != s_id)
-        {
-            return;
-        }
-
-        if elapsed(msg.target.send_time as f64) > 0.1 {
-            return;
-        }
-
+    fn receive_target_update(&mut self, t: QuantTrack) {
+        let track = Track::from(t);
         draw_diamond(
             (msg.target.pos + msg.target.vel * elapsed(msg.target.send_time as f64) as f32).into(),
             1000.,

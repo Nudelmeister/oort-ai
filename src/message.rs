@@ -1,149 +1,147 @@
+use super::track::Track;
 use oort_api::{
     prelude::{
-        byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt},
-        maths_rs::Vec2f,
+        byteorder::{ReadBytesExt, WriteBytesExt},
+        current_tick, id,
+        maths_rs::{prelude::Base, vec},
+        receive_bytes, send_bytes, world_size,
     },
     Class,
 };
 use std::io::Cursor;
 
-#[derive(Clone, Copy, Debug)]
-pub enum MyMessage {
-    MissileInit(MissileInit),
-    TargetUpdate(TargetUpdate),
-    PotentialTarget(TargetUpdate),
-    Pair(Pair),
-    PairTti(PairTti),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Msg {
+    /// `id() % 256`
+    pub sender_id: u8,
+    /// `current_tick() % 256`
+    pub send_tick: u8,
+    pub msg: MsgKind,
+    pub chksum: u8,
 }
-impl MyMessage {
-    pub fn from_bytes(data: [u8; 32]) -> Option<Self> {
-        let mut cursor = Cursor::new(data);
-        let discriminant = cursor.read_u8().ok()?;
-        match discriminant {
-            0 => Some(Self::MissileInit(MissileInit::from_bytes(&mut cursor)?)),
-            1 => Some(Self::TargetUpdate(TargetUpdate::from_bytes(&mut cursor)?)),
-            2 => Some(Self::PotentialTarget(TargetUpdate::from_bytes(
-                &mut cursor,
-            )?)),
-            3 => Some(Self::Pair(Pair::from_bytes(&mut cursor)?)),
-            4 => Some(Self::PairTti(PairTti::from_bytes(&mut cursor)?)),
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgKind {
+    SenderPos(QuantState),
+    SenderTgt(QuantTrack),
+    Tracks([QuantTrack; 4]),
+    SwitchChannel(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantTrack {
+    pub class: Class,
+    pub state: QuantState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantState {
+    pub pos: vec::Vec2<i8>,
+    pub vel: vec::Vec2<i8>,
+    pub noise: i8,
+}
+
+impl Msg {
+    pub fn receive() -> Option<Self> {
+        let data = receive_bytes()?;
+        let chksum = data.iter().fold(0u8, |s, e| s.wrapping_add(*e));
+
+        let mut data = Cursor::new(data.as_slice());
+        let sender_id = data.read_u8().ok()?;
+        let send_tick = data.read_u8().ok()?;
+        if send_tick != ((current_tick() - 1) % 256) as u8 {
+            return None;
+        }
+        let msg = MsgKind::from_bytes(&mut data)?;
+        let received_chksum = data.read_u8().ok()?;
+        if received_chksum != chksum {
+            return None;
+        }
+
+        Some(Self {
+            sender_id,
+            send_tick,
+            msg,
+            chksum,
+        })
+    }
+    pub fn send(msg: MsgKind) {
+        let sender_id = (id() % 256) as u8;
+        let send_tick = (current_tick() % 256) as u8;
+
+        let mut buf = [0; 32];
+        let mut data = Cursor::new(buf.as_mut_slice());
+        data.write_u8(sender_id).unwrap();
+        data.write_u8(send_tick).unwrap();
+        msg.to_bytes(&mut data);
+        let chksum_idx = data.position();
+        let mut chksum = buf.iter().fold(0u8, |s, e| s.wrapping_add(*e));
+        chksum = chksum.wrapping_add(chksum);
+        buf[chksum_idx as usize] = chksum;
+
+        send_bytes(&buf);
+    }
+}
+
+impl MsgKind {
+    fn from_bytes(data: &mut Cursor<&[u8]>) -> Option<Self> {
+        match data.read_u8().ok()? {
+            0 => Some(Self::SenderPos(QuantState::from_bytes(data)?)),
+            1 => Some(Self::SenderTgt(QuantTrack::from_bytes(data)?)),
+            2 => Some(Self::Tracks(Self::read_tracks(data)?)),
+            3 => Some(Self::SwitchChannel(data.read_u8().ok()?)),
             _ => None,
         }
     }
-    pub fn to_bytes(self) -> [u8; 32] {
-        let mut data = [0; 32];
-        let mut cursor = Cursor::new(data.as_mut_slice());
+    fn read_tracks(data: &mut Cursor<&[u8]>) -> Option<[QuantTrack; 4]> {
+        let mut arr = [QuantTrack {
+            class: Class::Unknown,
+            state: QuantState {
+                pos: vec::Vec2::zero(),
+                vel: vec::Vec2::zero(),
+                noise: 0,
+            },
+        }; 4];
+
+        for t in &mut arr {
+            *t = QuantTrack::from_bytes(data)?;
+        }
+
+        Some(arr)
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
         match self {
-            MyMessage::MissileInit(msg) => {
-                let _ = cursor.write_u8(0);
-                msg.to_bytes(&mut cursor);
+            MsgKind::SenderPos(state) => {
+                data.write_u8(0).unwrap();
+                state.to_bytes(data);
             }
-            MyMessage::TargetUpdate(msg) => {
-                let _ = cursor.write_u8(1);
-                msg.to_bytes(&mut cursor);
+            MsgKind::SenderTgt(track) => {
+                data.write_u8(1).unwrap();
+                track.to_bytes(data);
             }
-            MyMessage::PotentialTarget(msg) => {
-                let _ = cursor.write_u8(2);
-                msg.to_bytes(&mut cursor);
+            MsgKind::Tracks(tracks) => {
+                data.write_u8(2).unwrap();
+                tracks.into_iter().for_each(|t| t.to_bytes(data));
             }
-            MyMessage::Pair(msg) => {
-                let _ = cursor.write_u8(3);
-                msg.to_bytes(&mut cursor);
+            MsgKind::SwitchChannel(c) => {
+                data.write_u8(3).unwrap();
+                data.write_u8(c).unwrap();
             }
-            MyMessage::PairTti(msg) => {
-                let _ = cursor.write_u8(4);
-                msg.to_bytes(&mut cursor);
-            }
-        };
-
-        data
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PairTti {
-    pub sender_missile_id: u16,
-    pub time_to_impact: f32,
-}
-impl PairTti {
-    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
-        let sender_missile_id = data.read_u16::<NetworkEndian>().ok()?;
-        let time_to_impact = data.read_f32::<NetworkEndian>().ok()?;
-        Some(Self {
-            sender_missile_id,
-            time_to_impact,
-        })
-    }
-    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        let _ = data.write_u16::<NetworkEndian>(self.sender_missile_id);
-        let _ = data.write_f32::<NetworkEndian>(self.time_to_impact);
+impl From<Track> for QuantTrack {
+    fn from(value: Track) -> Self {
+        Self {
+            class: value.class,
+            state: value.into(),
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Pair {
-    pub missile_id_a: u16,
-    pub missile_id_b: u16,
-}
-impl Pair {
-    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
-        let missile_id_a = data.read_u16::<NetworkEndian>().ok()?;
-        let missile_id_b = data.read_u16::<NetworkEndian>().ok()?;
-        Some(Self {
-            missile_id_a,
-            missile_id_b,
-        })
-    }
-    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        let _ = data.write_u16::<NetworkEndian>(self.missile_id_a);
-        let _ = data.write_u16::<NetworkEndian>(self.missile_id_b);
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct MissileInit {
-    pub missile_id: u16,
-    pub target: TargetMsg,
-}
-impl MissileInit {
-    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
-        let missile_id = data.read_u16::<NetworkEndian>().ok()?;
-        let target = TargetMsg::from_bytes(data)?;
-        Some(Self { missile_id, target })
-    }
-    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        let _ = data.write_u16::<NetworkEndian>(self.missile_id);
-        self.target.to_bytes(data);
-    }
-}
-#[derive(Clone, Copy, Debug)]
-pub struct TargetUpdate {
-    pub missile_id: Option<u16>,
-    pub target: TargetMsg,
-}
-impl TargetUpdate {
-    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
-        let missile_id = data.read_u16::<NetworkEndian>().ok()?;
-        let missile_id = (missile_id != u16::MAX).then_some(missile_id);
-        let target = TargetMsg::from_bytes(data)?;
-        Some(Self { missile_id, target })
-    }
-    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        let _ = data.write_u16::<NetworkEndian>(self.missile_id.unwrap_or(u16::MAX));
-        self.target.to_bytes(data);
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct TargetMsg {
-    pub class: Class,
-    pub send_time: f32,
-    pub uncertanty: f32,
-    pub pos: Vec2f,
-    pub vel: Vec2f,
-}
-impl TargetMsg {
-    fn from_bytes(data: &mut Cursor<[u8; 32]>) -> Option<Self> {
+impl QuantTrack {
+    fn from_bytes(data: &mut Cursor<&[u8]>) -> Option<Self> {
         let class = match data.read_u8().ok()? {
             0 => Class::Fighter,
             1 => Class::Frigate,
@@ -155,25 +153,12 @@ impl TargetMsg {
             7 => Class::Unknown,
             _ => return None,
         };
+        let state = QuantState::from_bytes(data)?;
 
-        let send_time = data.read_f32::<NetworkEndian>().ok()?;
-        let uncertanty = data.read_f32::<NetworkEndian>().ok()?;
-
-        let px = data.read_f32::<NetworkEndian>().ok()?;
-        let py = data.read_f32::<NetworkEndian>().ok()?;
-        let vx = data.read_f32::<NetworkEndian>().ok()?;
-        let vy = data.read_f32::<NetworkEndian>().ok()?;
-
-        Some(Self {
-            class,
-            send_time,
-            uncertanty,
-            pos: Vec2f::new(px, py),
-            vel: Vec2f::new(vx, vy),
-        })
+        Some(Self { class, state })
     }
     fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
-        let _ = data.write_u8(match self.class {
+        data.write_u8(match self.class {
             Class::Fighter => 0,
             Class::Frigate => 1,
             Class::Cruiser => 2,
@@ -182,12 +167,54 @@ impl TargetMsg {
             Class::Missile => 5,
             Class::Torpedo => 6,
             Class::Unknown => 7,
-        });
-        let _ = data.write_f32::<NetworkEndian>(self.send_time);
-        let _ = data.write_f32::<NetworkEndian>(self.uncertanty);
-        let _ = data.write_f32::<NetworkEndian>(self.pos.x);
-        let _ = data.write_f32::<NetworkEndian>(self.pos.y);
-        let _ = data.write_f32::<NetworkEndian>(self.vel.x);
-        let _ = data.write_f32::<NetworkEndian>(self.vel.y);
+        })
+        .unwrap();
+        self.state.to_bytes(data);
+    }
+}
+
+impl From<Track> for QuantState {
+    fn from(value: Track) -> Self {
+        let pos_conv = 64. * world_size();
+        let vel_conv = 64. * 1000.;
+        let unc_conv = 64. * 500.;
+
+        let (p, v, _) = value.pva();
+        let uncertanty = value.uncertanty();
+
+        Self {
+            pos: vec::Vec2::<i8>::new(
+                (p.x / pos_conv).round() as i8,
+                (p.y / pos_conv).round() as i8,
+            ),
+            vel: vec::Vec2::<i8>::new(
+                (v.x / vel_conv).round() as i8,
+                (v.y / vel_conv).round() as i8,
+            ),
+            noise: (uncertanty / unc_conv) as i8,
+        }
+    }
+}
+
+impl QuantState {
+    fn from_bytes(data: &mut Cursor<&[u8]>) -> Option<Self> {
+        let px = data.read_i8().ok()?;
+        let py = data.read_i8().ok()?;
+        let vx = data.read_i8().ok()?;
+        let vy = data.read_i8().ok()?;
+        let n = data.read_i8().ok()?;
+
+        Some(Self {
+            pos: vec::Vec2::new(px, py),
+            vel: vec::Vec2::new(vx, vy),
+            noise: n,
+        })
+    }
+    fn to_bytes(self, data: &mut Cursor<&mut [u8]>) {
+        data.write_i8(self.pos.x).unwrap();
+        data.write_i8(self.pos.y).unwrap();
+        data.write_i8(self.vel.x).unwrap();
+        data.write_i8(self.vel.y).unwrap();
+        data.write_i8(self.noise).unwrap();
     }
 }

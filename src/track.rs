@@ -1,3 +1,5 @@
+use crate::message::QuantTrack;
+
 use super::{direction_to, elapsed, position_in};
 use oort_api::prelude::{maths_rs::prelude::Base, *};
 use std::f64::consts::SQRT_2;
@@ -223,7 +225,9 @@ impl Track {
             .update_fixed_noise(pos, vel, noise, elapsed(self.last_seen));
         self.last_seen = self.last_seen.max(last_seen);
     }
-
+    pub fn update_from_quant(&mut self, q: QuantTrack) {
+        todo!()
+    }
     pub fn uncertanty(&self) -> f64 {
         let (p_c, v_c, a_c) = self.state.predict_cov(elapsed(self.last_seen));
         p_c.length() + v_c.length() + a_c.length()

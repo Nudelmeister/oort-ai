@@ -1,4 +1,4 @@
-use message::{MissileInit, MyMessage, Pair, TargetMsg, TargetUpdate};
+use message::{Msg, MsgKind, QuantState, QuantTrack};
 use missile::Missile;
 use oort_api::prelude::{maths_rs::prelude::Base, *};
 use radar::UnifiedRadar;
@@ -43,7 +43,6 @@ pub struct Fighter {
     aimbot: AimBot,
     aim_id: u32,
     next_missile_id: u16,
-    send_queue: VecDeque<MyMessage>,
     move_target: Vec2,
 }
 
@@ -60,7 +59,6 @@ impl Fighter {
             aimbot: AimBot::new(70., -70_000.),
             aim_id: 0,
             next_missile_id: 0,
-            send_queue: VecDeque::new(),
             move_target: Vec2::zero(),
         }
     }
@@ -116,45 +114,11 @@ impl Fighter {
             self.radar.scan_direction = t.direction().angle();
             self.radar.scan_angle_max = 0.1 * TAU;
 
-            if current_tick() % 30 == 0
-                && !self
-                    .send_queue
-                    .iter()
-                    .any(|m| matches!(m, MyMessage::TargetUpdate(_)))
-            {
-                let (p, v, _) = t.pva();
-                let message = MyMessage::TargetUpdate(TargetUpdate {
-                    missile_id: None,
-                    target: TargetMsg {
-                        class: t.class,
-                        send_time: t.last_seen as f32,
-                        uncertanty: t.uncertanty() as f32,
-                        pos: p.into(),
-                        vel: v.into(),
-                    },
-                });
-                self.send_queue.push_back(message);
-            }
             if reload_ticks(1) == 0 {
                 fire(1);
-                let message = MyMessage::MissileInit(MissileInit {
-                    missile_id: self.next_missile_id,
-                    target: TargetMsg {
-                        class: t.class,
-                        send_time: t.last_seen as f32,
-                        uncertanty: t.uncertanty() as f32,
-                        pos: t.position().into(),
-                        vel: t.velocity().into(),
-                    },
-                });
-                self.send_queue.push_front(message);
-                self.next_missile_id += 1;
-                if self.next_missile_id >= 2 {
-                    self.send_queue.push_back(MyMessage::Pair(Pair {
-                        missile_id_a: self.next_missile_id - 1,
-                        missile_id_b: self.next_missile_id - 2,
-                    }));
-                }
+                Msg::send(MsgKind::SenderTgt(QuantTrack::from(t)));
+            } else if current_tick() % 15 == 0 {
+                Msg::send(MsgKind::SenderTgt(QuantTrack::from(t)));
             }
         }
 
@@ -171,10 +135,6 @@ impl Fighter {
         } else {
             accelerate(self.move_target - position());
             draw_triangle(self.move_target, 1000., 0xFF00_FF00);
-        }
-
-        if let Some(m) = self.send_queue.pop_front() {
-            send_bytes(&m.to_bytes());
         }
     }
 }

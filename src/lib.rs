@@ -1,8 +1,7 @@
-use message::{Msg, MsgKind, QuantState, QuantTrack};
+use message::{Msg, MsgKind, QuantTrack};
 use missile::Missile;
 use oort_api::prelude::{maths_rs::prelude::Base, *};
 use radar::UnifiedRadar;
-use std::collections::VecDeque;
 
 mod message;
 mod missile;

@@ -3,6 +3,7 @@ use missile::Missile;
 use oort_api::prelude::{maths_rs::prelude::Base, *};
 use radar::UnifiedRadar;
 
+mod intel;
 mod message;
 mod missile;
 mod radar;

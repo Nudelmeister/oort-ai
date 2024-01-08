@@ -1,214 +1,206 @@
-use super::{elapsed, track::Track};
-use oort_api::prelude::*;
-use std::ops::RangeInclusive;
-fn class_timeout(class: Class) -> f64 {
-    match class {
-        Class::Frigate => 5.,
-        Class::Cruiser => 10.,
-        Class::Asteroid => 30.,
-        Class::Missile | Class::Torpedo => 0.5,
-        Class::Target | Class::Fighter | Class::Unknown => 2.5,
-    }
+use crate::{
+    distance_to, elapsed, heading_to,
+    track::{class_radius, class_timeout, Track},
+    F64Ord,
+};
+use oort_api::{
+    prelude::{self as oa, Vec2Extras},
+    Class,
+};
+
+pub struct Radar {
+    next_track_id: u64,
+    tracks: Vec<Track>,
+    track_idx: usize,
+    tracked_id: Option<u64>,
+    search_heading: f64,
+    search_fov: f64,
+    next_search_behind: Option<f64>,
+    search_limit: Option<(f64, f64)>,
+    search_dir: SearchDirection,
 }
 
-pub struct LockingRadar {
-    pub track: Option<Track>,
-}
-impl LockingRadar {
-    pub fn new() -> Self {
-        Self { track: None }
-    }
-    pub fn tick(&mut self) {
-        if let Some(contact) = scan() {
-            match self.track.as_mut() {
-                Some(track) if contact.class == track.class => track.update(&contact),
-                None => self.track = Some(Track::from_contact(0, &contact)),
-                _ => (),
-            }
-        }
-        if self
-            .track
-            .as_ref()
-            .map_or(false, |t| elapsed(t.last_seen) > class_timeout(t.class))
-        {
-            self.track = None;
-        }
-        match self.track.as_ref() {
-            Some(track) => {
-                let (h, a, d) = track.radar_track_look();
-                set_radar_heading(h);
-                set_radar_width(a / d);
-                set_radar_min_distance(d - a);
-                set_radar_max_distance(d + a);
-            }
-            None => {
-                set_radar_heading(heading());
-                set_radar_width(0.125 * TAU);
-                set_radar_min_distance(0.);
-                set_radar_max_distance(f64::MAX);
-            }
-        }
-    }
+enum SearchDirection {
+    Cw,
+    Ccw,
 }
 
-pub struct UnifiedRadar {
-    next_id: u32,
-    scan_heading: f64,
-    scan_distance_range: RangeInclusive<f64>,
-    pub scan_direction: f64,
-    pub scan_angle_max: f64,
-    scan_fov: f64,
-    contacts: Vec<Track>,
-    tracking: Vec<u32>,
-    check_behind: bool,
-    track_all: bool,
-}
-
-impl UnifiedRadar {
-    const CONTACT_FUSE_PER_DIST: f64 = 0.1;
-    const CONTACT_FUSE_MIN: f64 = 50.;
-
-    pub fn new(
-        scan_distance_range: RangeInclusive<f64>,
-        scan_direction: f64,
-        scan_angle_max: f64,
-        scan_fov: f64,
-        track_all: bool,
-    ) -> Self {
+impl Radar {
+    pub fn new(search_fov: f64) -> Self {
         Self {
-            next_id: 0,
-            scan_heading: 0.,
-            scan_distance_range,
-            scan_direction,
-            scan_angle_max,
-            scan_fov,
-            contacts: Vec::new(),
-            tracking: Vec::new(),
-            check_behind: false,
-            track_all,
+            next_track_id: 0,
+            tracks: Vec::new(),
+            track_idx: 0,
+            tracked_id: None,
+            search_heading: 0.0,
+            search_fov,
+            next_search_behind: None,
+            search_limit: None,
+            search_dir: SearchDirection::Ccw,
         }
     }
-
-    pub fn contacts(&self) -> &[Track] {
-        &self.contacts
+    pub fn set_limits(&mut self, search_limit: Option<(f64, f64)>) {
+        self.search_limit = search_limit;
     }
 
-    fn evict_contacts(&mut self) {
-        self.contacts
-            .retain(|c| elapsed(c.last_seen) <= class_timeout(c.class));
-        self.tracking
-            .retain(|id| self.contacts.iter().any(|c| *id == c.id));
+    pub fn tracks(&self) -> &[Track] {
+        &self.tracks
     }
 
-    fn prepare_track_tick(&mut self, idx: usize) {
-        let track = self
-            .contacts
-            .iter()
-            .find(|c| c.id == self.tracking[idx])
-            .unwrap();
-
-        let (h, a, d) = track.radar_track_look();
-        let w = a / d;
-        set_radar_width(w);
-        set_radar_heading(h);
-        set_radar_min_distance(d - 0.5 * a);
-        set_radar_max_distance(d + 0.5 * a);
-    }
-    fn prepare_search_tick(&mut self) {
-        set_radar_width(self.scan_fov);
-        if self.check_behind {
-            self.check_behind = false;
-            set_radar_min_distance(
-                radar_max_distance() + radar_max_distance() * Self::CONTACT_FUSE_PER_DIST,
-            );
-            set_radar_max_distance(*self.scan_distance_range.end());
-            set_radar_heading(self.scan_heading);
-        } else {
-            self.scan_heading += self.scan_fov;
-            if angle_diff(self.scan_heading, self.scan_direction).abs() > self.scan_angle_max {
-                self.scan_heading = self.scan_direction - self.scan_angle_max;
-            }
-            set_radar_heading(self.scan_heading);
-            if let Some(same_heading_track_dist) = self
-                .tracking
-                .iter()
-                .flat_map(|id| self.contacts.iter().find(|c| c.id == *id))
-                .filter(|tc| angle_diff(tc.heading(), self.scan_heading).abs() < self.scan_fov)
-                .map(|tc| tc.distance())
-                .min_by_key(|d| (d * 1000.) as i64)
-            {
-                set_radar_max_distance(self.scan_distance_range.end().min(
-                    same_heading_track_dist - same_heading_track_dist * Self::CONTACT_FUSE_PER_DIST,
-                ));
-                self.check_behind = true;
-            } else {
-                set_radar_max_distance(*self.scan_distance_range.end());
-            }
-            set_radar_min_distance(*self.scan_distance_range.start());
-        }
+    pub fn get_target(&self, mut prio: impl FnMut(&Track) -> f64) -> Option<&Track> {
+        self.tracks.iter().max_by_key(|t| F64Ord(prio(t)))
     }
 
     pub fn tick(&mut self) {
-        debug!("{:?}", self.tracking);
-        for c in &self.contacts {
-            c.debug();
-        }
-        if let Some(contact) = scan() {
-            self.integrate_contact(&contact);
-        }
+        self.evict_tracks();
+        self.fuse_tracks();
+        self.debug_tracks();
+        self.scan();
 
-        let select = current_tick() as usize % (self.tracking.len() + 1);
-        if select > 0 {
-            self.prepare_track_tick(select - 1);
-        } else {
-            self.prepare_search_tick();
-        }
+        if oa::current_tick() % 2 == 0 || self.tracks.is_empty() {
+            let looking_at_known_track = || {
+                self.tracks.iter().find(|t| {
+                    oa::angle_diff(heading_to(t.pos_in(oa::TICK_LENGTH)), self.search_heading).abs()
+                        < 0.5 * self.search_fov
+                })
+            };
 
-        self.evict_contacts();
-    }
-
-    fn integrate_contact(&mut self, contact: &ScanResult) {
-        if let Some((existing_track, _)) = self
-            .contacts
-            .iter_mut()
-            .filter(|c| c.class == contact.class)
-            .filter_map(|c| {
-                let (p, v, _) = c.pva();
-                let fuse_dist = (p.distance(position()) * Self::CONTACT_FUSE_PER_DIST)
-                    .max(Self::CONTACT_FUSE_MIN);
-                let pos_match = p.distance(contact.position) < fuse_dist;
-                let vel_match = v.distance(contact.velocity) < fuse_dist;
-                (pos_match && vel_match).then_some((
-                    c,
-                    p.distance(contact.position) + v.distance(contact.velocity),
-                ))
-            })
-            .min_by_key(|(_, d)| (d * 1000.) as i64)
-        {
-            existing_track.update(contact);
-        } else {
-            self.contacts.push(Track::new(
-                self.next_id,
-                contact.class,
-                contact.position,
-                contact.velocity,
-            ));
-            if self.track_all {
-                self.start_tracking(self.next_id);
+            oa::set_radar_heading(self.search_heading);
+            oa::set_radar_width(self.search_fov);
+            if let Some(min_dist) = self.next_search_behind.take() {
+                oa::set_radar_min_distance(min_dist);
+                oa::set_radar_max_distance(f64::MAX);
+                self.next_search_heading();
+            } else if let Some(t) = looking_at_known_track() {
+                oa::set_radar_min_distance(0.0);
+                oa::set_radar_max_distance(
+                    t.pos_in(oa::TICK_LENGTH).distance(oa::position())
+                        - t.error_in(oa::TICK_LENGTH)
+                        - class_radius(t.class()),
+                );
+                self.next_search_behind = Some(
+                    t.pos_in(3.0 * oa::TICK_LENGTH).distance(oa::position())
+                        + t.error_in(3.0 * oa::TICK_LENGTH)
+                        + class_radius(t.class()),
+                );
+            } else {
+                oa::set_radar_min_distance(0.0);
+                oa::set_radar_max_distance(f64::MAX);
+                self.next_search_heading();
             }
-            self.next_id += 1;
+        } else {
+            let t = &self.tracks[self.track_idx % self.tracks.len()];
+            self.tracked_id = Some(t.id());
+            self.track_idx += 1;
+
+            let p = t.pos_in(oa::TICK_LENGTH);
+            let e_c = match t.class() {
+                Class::Missile | Class::Torpedo => 2.0,
+                _ => 1.0,
+            };
+            let e = e_c * t.error_in(oa::TICK_LENGTH);
+            let d = distance_to(p);
+            let r = class_radius(t.class());
+
+            oa::set_radar_heading(heading_to(p));
+            oa::set_radar_width(2.0 * (e + r) / d);
+            oa::set_radar_min_distance(d - e - r);
+            oa::set_radar_max_distance(d + e + r);
         }
     }
 
-    pub fn start_tracking(&mut self, id: u32) {
-        if self.contacts.iter().any(|c| c.id == id) && !self.tracking.contains(&id) {
-            self.tracking.push(id);
+    fn next_search_heading(&mut self) {
+        match self.search_dir {
+            SearchDirection::Cw => self.search_heading -= self.search_fov,
+            SearchDirection::Ccw => self.search_heading += self.search_fov,
+        }
+        let Some((ccw_lim, cw_lim)) = self.search_limit else {
+            return;
+        };
+        if (self.search_heading + 0.5 * self.search_fov) >= ccw_lim {
+            self.search_heading = ccw_lim - 0.5 * self.search_fov;
+            self.search_dir = SearchDirection::Cw;
+        } else if (self.search_heading - 0.5 * self.search_fov) <= cw_lim {
+            self.search_heading = cw_lim + 0.5 * self.search_fov;
+            self.search_dir = SearchDirection::Ccw;
+        }
+    }
+    fn evict_tracks(&mut self) {
+        self.tracks
+            .retain(|t| !t.timed_out() || self.tracked_id.map_or(false, |id| t.id() == id));
+    }
+    fn fuse_tracks(&mut self) {
+        for (i, t) in self.tracks.iter().enumerate() {
+            if let Some((ot_i, _)) = self
+                .tracks
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .find(|(_, ot)| t.same_track(ot))
+            {
+                let ot = self.tracks.swap_remove(ot_i);
+                self.tracks[i].track_update(&ot);
+                return;
+            }
         }
     }
 
-    pub fn prio_track(&self) -> Option<&Track> {
-        self.contacts
-            .iter()
-            .max_by_key(|t| (t.priority() * 1000.) as i64)
+    fn get_mut_by_id(&mut self, id: u64) -> Option<&mut Track> {
+        self.tracks.iter_mut().find(|t| t.id() == id)
     }
+
+    fn scan(&mut self) {
+        if let Some(id) = self.tracked_id.take() {
+            self.track_scan(id);
+        } else {
+            self.search_scan();
+        }
+    }
+
+    fn track_scan(&mut self, id: u64) {
+        let Some(track) = self.get_mut_by_id(id) else {
+            return;
+        };
+        if let Some(contact) = oa::scan() {
+            track.scan_update(&contact);
+        } else if elapsed(track.last_seen()) > 0.1 * class_timeout(track.class())
+            && track.error() < 100.0
+        {
+            let id = track.id();
+            if let Some(idx) = self.tracks.iter().position(|t| t.id() == id) {
+                self.tracks.swap_remove(idx);
+            }
+        }
+    }
+
+    fn search_scan(&mut self) {
+        let Some(contact) = oa::scan() else {
+            return;
+        };
+
+        let error = scan_error_heuristic(contact.rssi, contact.snr);
+
+        let same_track = |track: &Track| {
+            if track.class() != contact.class {
+                return false;
+            }
+            let (tp, tv, _) = track.pva();
+            let effective_dist = (tp.distance(contact.position) + tv.distance(contact.velocity))
+                - (track.error() + error);
+            effective_dist < class_radius(track.class())
+        };
+
+        if !self.tracks.iter().any(same_track) {
+            self.tracks.push(Track::new(self.next_track_id, &contact));
+            self.next_track_id += 1;
+        }
+    }
+
+    fn debug_tracks(&self) {
+        self.tracks.iter().for_each(Track::debug);
+    }
+}
+
+pub fn scan_error_heuristic(rssi: f64, snr: f64) -> f64 {
+    (rssi / snr).powi(2)
 }

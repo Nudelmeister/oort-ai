@@ -94,11 +94,7 @@ impl Radar {
             self.track_idx += 1;
 
             let p = t.pos_in(oa::TICK_LENGTH);
-            let e_c = match t.class() {
-                Class::Missile | Class::Torpedo => 2.0,
-                _ => 1.0,
-            };
-            let e = e_c * t.error_in(oa::TICK_LENGTH);
+            let e = t.error_in(oa::TICK_LENGTH);
             let d = distance_to(p);
             let r = class_radius(t.class());
 
@@ -163,13 +159,13 @@ impl Radar {
         };
         if let Some(contact) = oa::scan() {
             track.scan_update(&contact);
-        } else if elapsed(track.last_seen()) > 0.1 * class_timeout(track.class())
-            && track.error() < 100.0
-        {
-            let id = track.id();
-            if let Some(idx) = self.tracks.iter().position(|t| t.id() == id) {
-                self.tracks.swap_remove(idx);
-            }
+            //} else if elapsed(track.last_seen()) > 0.1 * class_timeout(track.class())
+            //    && track.error() < 100.0
+            //{
+            //    let id = track.id();
+            //    if let Some(idx) = self.tracks.iter().position(|t| t.id() == id) {
+            //        self.tracks.swap_remove(idx);
+            //    }
         }
     }
 

@@ -1,5 +1,5 @@
 use crate::{
-    heading_to, position_in,
+    elapsed, heading_to, missile, position_in,
     radar::Radar,
     track::{class_radius, Track},
 };
@@ -12,6 +12,7 @@ use std::f64::consts::TAU;
 pub struct Fighter {
     radar: Radar,
     last_target: Option<u64>,
+    aimbot: Aimbot,
 }
 
 impl Fighter {
@@ -19,9 +20,14 @@ impl Fighter {
         Self {
             radar: Radar::new(0.01 * TAU),
             last_target: None,
+            aimbot: Aimbot::new(),
         }
     }
     pub fn tick(&mut self) {
+        oa::draw_line(Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), 0xFF0000);
+        oa::draw_line(Vec2::new(0.0, 0.0), Vec2::new(0.0, 10.0), 0x00FF00);
+
+        //oa::fire(1);
         self.radar.tick();
         if oa::current_time() < (0.05 / oa::TICK_LENGTH).recip() * 2.0 {
             return;
@@ -32,7 +38,9 @@ impl Fighter {
         //    oa::accelerate(Vec2::new(-100.0, 0.0));
         //}
         for track in self.radar.tracks() {
-            let (t, cp) = track.closest_approach();
+            let Some((t, cp)) = track.closest_approach() else {
+                continue;
+            };
             let p = position_in(t);
             let d = cp - p;
             if d.length() < 10.0 * class_radius(oa::class()) {
@@ -49,7 +57,7 @@ impl Fighter {
             x = heading_to(t.pos());
             self.last_target = Some(t.id());
             if let Some((impact_time, impact_pos)) = t.intercept_aim_pos(1000.0) {
-                oa::torque(aim_torque(impact_pos, t.vel_in(impact_time)));
+                oa::torque(self.aimbot.aim_at_torque(impact_pos));
                 oa::draw_triangle(impact_pos, 50.0, 0xFFA0A0);
                 oa::draw_line(
                     oa::position(),
@@ -83,9 +91,20 @@ impl Default for Fighter {
 }
 
 fn missile_prio(track: &Track) -> f64 {
-    let (time, pos) = track.closest_approach();
-    20.0 * class_radius(oa::class()) / pos.distance(oa::position() + oa::velocity() * time)
-        * (time / 2.0 + 0.5).recip()
+    let Some((time, pos)) = track.closest_approach() else {
+        return 0.0;
+    };
+    let danger = ((class_radius(oa::class()) + missile::FRAG_LETHAL_RANGE)
+        / pos.distance(oa::position() + oa::velocity() * time))
+    .powi(2)
+    .min(1.0);
+    let urgency = (time.max(0.1) / 2.0).recip();
+
+    let max_prio = danger * 25.0;
+
+    oa::debug!("{danger}, {urgency}, {max_prio}");
+
+    (urgency * danger * 10.0).min(max_prio)
 }
 
 fn target_prio(track: &Track, last_target_id: Option<u64>) -> f64 {
@@ -119,5 +138,61 @@ fn aim_torque(target_pos: Vec2, target_vel: Vec2) -> f64 {
     };
 
     oa::max_angular_acceleration()
-        * (150.0 * (diff + var) + 10.0 * rel_rot.signum() * rel_rot.powi(2) + 0.25 * rel_rot)
+        * (150.0 * (diff + var) + 10.0 * rel_rot.signum() * rel_rot.powi(2) + 0.5 * rel_rot)
+}
+
+struct Aimbot {
+    last_heading: f64,
+    last_time: f64,
+}
+
+impl Aimbot {
+    pub fn new() -> Self {
+        Self {
+            last_heading: 0.0,
+            last_time: 0.0,
+        }
+    }
+    pub fn aim_at_torque(&mut self, target_pos: Vec2) -> f64 {
+        let var_period = (0.2 / oa::TICK_LENGTH).round() as u32;
+        let var_period2 = 0.5;
+        let var_magnitude = TAU * 0.001;
+        let var_magnitude2 = 20.0;
+        let var_tick = oa::current_tick() % var_period;
+
+        let var = if (oa::current_tick() / var_period) % 2 == 0 {
+            var_magnitude * var_tick as f64 / var_period as f64 - 0.5 * var_magnitude
+        } else {
+            0.5 * var_magnitude - var_magnitude * var_tick as f64 / var_period as f64
+        };
+        let var = 0.0;
+
+        let target_pos = target_pos
+            + Vec2::new(var_magnitude2, 0.0).rotate(TAU * oa::current_time() / var_period2);
+
+        let to_t = target_pos - oa::position();
+        let diff = angle_diff(oa::heading(), to_t.angle());
+
+        oa::draw_line(
+            oa::position(),
+            oa::position() + Vec2::new(100000.0, 0.0).rotate(to_t.angle()),
+            0xa0a0a0,
+        );
+
+        let rel_rot = angle_diff(self.last_heading, diff) / elapsed(self.last_time);
+
+        self.last_heading = diff;
+        self.last_time = oa::current_time();
+
+        oa::debug!("d {diff:.3}, r {rel_rot:.3}, v {var:.3}");
+        oa::debug!(
+            "d {:.3}, r^2 {:.3}, r {:.3}",
+            150.0 * (diff + var),
+            50.0 * rel_rot.signum() * rel_rot.powi(2),
+            10.0 * rel_rot
+        );
+
+        oa::max_angular_acceleration()
+            * (100.0 * (diff + var) + 10.0 * rel_rot.signum() * rel_rot.powi(2) + 1.0 * rel_rot)
+    }
 }

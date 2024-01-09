@@ -80,10 +80,10 @@ impl Track {
             0.0,
             class_color(self.class()),
         );
-        let maxt = 2.0 * class_timeout(self.class);
-        let dt = maxt / 10.0;
+        let maxt = 5.0 * class_timeout(self.class);
+        let dt = maxt / 15.0;
         let mut x = p;
-        for i in 1..=10 {
+        for i in 1..=15 {
             let t = dt * i as f64;
             let xnext = self.pva_in(t).0;
             oa::draw_line(x, xnext, 0xA0A0A0);
@@ -91,7 +91,7 @@ impl Track {
         }
     }
 
-    pub fn closest_approach(&self) -> (f64, Vec2) {
+    pub fn closest_approach(&self) -> Option<(f64, Vec2)> {
         let p = self.pos() - oa::position();
         let v = self.vel() - oa::velocity();
         let a = self.acc();
@@ -124,7 +124,7 @@ impl Track {
             .filter(|r| **r > 0.0)
             .filter(|r| is_closest(**r))
             .min_by_key(|r| F64Ord(**r))
-            .map_or_else(|| (0.0, self.pos()), |t| (*t, self.pos_in(*t)))
+            .map(|t| (*t, self.pos_in(*t)))
     }
     pub fn intercept_aim_pos(&self, speed: f64) -> Option<(f64, Vec2)> {
         let t = self.intercept_time(speed)?;
@@ -171,7 +171,7 @@ impl Track {
         let (op, ov, oa) = other.pva();
 
         class_radius(self.class()) * 2.0
-            > (0.9 * p.distance(op) + 0.08 * v.distance(ov) + 0.02 * a.distance(oa))
+            > (0.85 * p.distance(op) + 0.1 * v.distance(ov) + 0.05 * a.distance(oa))
                 - (self.error() + other.error())
     }
     pub fn timed_out(&self) -> bool {

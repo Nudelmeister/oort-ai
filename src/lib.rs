@@ -1,12 +1,13 @@
 //mod intel;
 //mod liblib;
 //mod message;
-//mod missile;
+mod missile;
 mod radar;
 mod roots;
 mod track;
 
 use fighter::Fighter;
+use missile::Missile;
 use oort_api::{
     prelude::{self as oa, Vec2, Vec2Extras},
     Class,
@@ -16,12 +17,14 @@ mod fighter;
 
 pub enum Ship {
     Fighter(Fighter),
+    Missile(Missile),
 }
 
 impl Ship {
     pub fn new() -> Self {
         match oa::class() {
             Class::Fighter => Self::Fighter(Fighter::new()),
+            Class::Missile => Self::Missile(Missile::new()),
             _ => unimplemented!(),
         }
     }
@@ -29,6 +32,7 @@ impl Ship {
     pub fn tick(&mut self) {
         match self {
             Self::Fighter(s) => s.tick(),
+            Self::Missile(s) => s.tick(),
         }
     }
 }

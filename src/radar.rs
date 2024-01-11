@@ -1,12 +1,9 @@
 use crate::{
-    distance_to, elapsed, heading_to,
-    track::{class_radius, class_timeout, Track},
+    distance_to, heading_to,
+    track::{class_radius, Track},
     F64Ord,
 };
-use oort_api::{
-    prelude::{self as oa, Vec2Extras},
-    Class,
-};
+use oort_api::prelude::{self as oa, Vec2Extras};
 
 pub struct Radar {
     next_track_id: u64,
@@ -20,7 +17,7 @@ pub struct Radar {
     search_dir: SearchDirection,
 }
 
-enum SearchDirection {
+pub enum SearchDirection {
     Cw,
     Ccw,
 }

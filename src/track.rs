@@ -1,4 +1,4 @@
-use crate::{elapsed, radar::scan_error_heuristic, roots, F64Ord};
+use crate::{elapsed, position_in, radar::scan_error_heuristic, roots, F64Ord};
 use oort_api::{
     prelude::{self as oa, maths_rs::prelude::Base, ScanResult, Vec2, Vec2Extras},
     Class,
@@ -91,7 +91,12 @@ impl Track {
         }
     }
 
-    pub fn closest_approach(&self) -> Option<(f64, Vec2)> {
+    pub fn closest_approach_offset(&self) -> Option<(f64, Vec2)> {
+        self.closest_approach()
+            .map(|time| (time, self.pos_in(time) - position_in(time)))
+    }
+
+    pub fn closest_approach(&self) -> Option<f64> {
         let p = self.pos() - oa::position();
         let v = self.vel() - oa::velocity();
         let a = self.acc();
@@ -121,34 +126,29 @@ impl Track {
         roots
             .as_ref()
             .iter()
-            .filter(|r| **r > 0.0)
-            .filter(|r| is_closest(**r))
-            .min_by_key(|r| F64Ord(**r))
-            .map(|t| (*t, self.pos_in(*t)))
+            .copied()
+            .filter(|r| *r > 0.0)
+            .filter(|r| is_closest(*r))
+            .min_by_key(|r| F64Ord(*r))
     }
-    pub fn intercept_aim_pos(&self, speed: f64) -> Option<(f64, Vec2)> {
-        let t = self.intercept_time(speed)?;
-        let p = self.pos();
-        let v = self.vel() - oa::velocity();
-        let a = self.acc();
-        let x = t.powi(2) * 0.5 * a + t * v + p;
-        Some((t, x))
+    pub fn intercept_aim_pos(&self, c_vel: f64, c_acc: f64) -> Option<(f64, Vec2)> {
+        self.intercept(c_vel, c_acc)
+            .map(|time| (time, self.pos_in(time) - oa::velocity() * time))
     }
-    pub fn intercept_time(&self, speed: f64) -> Option<f64> {
+    pub fn intercept(&self, c_vel: f64, c_acc: f64) -> Option<f64> {
         let (pt, vt, a) = self.pva();
         let p = pt - oa::position();
         let v = vt - oa::velocity();
-        let s = speed;
 
         // 0 =
-        //     t^4 * 0.25 * a.a
+        //     t^4 * 0.25 * (a.a - c_acc^2)
         //   + t^3 * a.v
-        //   + t^2 * (a.p+v.v-s^2)
+        //   + t^2 * (a.p+v.v-c_vel^2)
         //   + t   * 2 * p.v
         //   +       p.p
-        let a4 = 0.25 * a.dot(a);
+        let a4 = 0.25 * (a.dot(a) - c_acc.powi(2));
         let a3 = a.dot(v);
-        let a2 = a.dot(p) + v.dot(v) - s.powi(2);
+        let a2 = a.dot(p) + v.dot(v) - c_vel.powi(2);
         let a1 = 2.0 * p.dot(v);
         let a0 = p.dot(p);
 
@@ -160,7 +160,6 @@ impl Track {
             .copied()
             .filter(|r| *r > 0.0)
             .min_by_key(|r| F64Ord(*r))
-            .map(|t| ((t / oa::TICK_LENGTH).floor() - 1.0) * oa::TICK_LENGTH)
     }
 
     pub fn same_track(&self, other: &Self) -> bool {

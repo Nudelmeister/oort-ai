@@ -3,6 +3,7 @@ const MODULES: &[(&str, &str)] = &[
     ("missile", "src/missile.rs"),
     //("message", "src/message.rs"),
     ("radar", "src/radar.rs"),
+    ("radar_util", "src/radar_util.rs"),
     ("roots", "src/roots/mod.rs"),
     ("track", "src/track.rs"),
     //("message", "src/message.rs"),

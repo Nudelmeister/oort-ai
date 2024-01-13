@@ -91,10 +91,9 @@ impl Fighter {
             self.last_target = None;
         }
         if self.last_target.is_some() {
-            self.radar
-                .set_limits(Some((x + TAU * 0.125, x - TAU * 0.125)));
+            self.radar.set_cone_search(0.01 * TAU, 0.25 * TAU, x);
         } else {
-            self.radar.set_limits(None);
+            self.radar.set_circular_search(0.01 * TAU);
         }
     }
 }

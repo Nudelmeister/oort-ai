@@ -1,5 +1,6 @@
 use crate::{
     distance_to, elapsed, heading_to,
+    radar_util::{scan_error_heuristic, set_to_track, CircularSearch, ConeSearch, RadarSearch},
     track::{class_radius, class_timeout, Track},
     F64Ord,
 };
@@ -10,16 +11,8 @@ pub struct Radar {
     tracks: Vec<Track>,
     track_idx: usize,
     tracked_id: Option<u64>,
-    search_heading: f64,
-    search_fov: f64,
-    next_search_behind: Option<f64>,
-    search_limit: Option<(f64, f64)>,
-    search_dir: SearchDirection,
-}
-
-pub enum SearchDirection {
-    Cw,
-    Ccw,
+    max_track_width: f64,
+    search: RadarSearch,
 }
 
 impl Radar {
@@ -29,15 +22,25 @@ impl Radar {
             tracks: Vec::new(),
             track_idx: 0,
             tracked_id: None,
-            search_heading: 0.0,
-            search_fov,
-            next_search_behind: None,
-            search_limit: None,
-            search_dir: SearchDirection::Ccw,
+            max_track_width: search_fov,
+            search: RadarSearch::Circular(CircularSearch::new(search_fov)),
         }
     }
-    pub fn set_limits(&mut self, search_limit: Option<(f64, f64)>) {
-        self.search_limit = search_limit;
+    pub fn set_cone_search(&mut self, width: f64, max_angle: f64, heading: f64) {
+        if let Some(cone) = self.search.cone_mut() {
+            cone.set_width(width);
+            cone.set_max_angle(max_angle);
+            cone.set_heading(heading);
+        } else {
+            self.search = RadarSearch::Cone(ConeSearch::new(width, max_angle, heading));
+        }
+    }
+    pub fn set_circular_search(&mut self, width: f64) {
+        if let Some(circle) = self.search.circular_mut() {
+            circle.set_width(width);
+        } else {
+            self.search = RadarSearch::Circular(CircularSearch::new(width));
+        }
     }
 
     pub fn tracks(&self) -> &[Track] {
@@ -55,69 +58,46 @@ impl Radar {
         self.scan();
 
         if oa::current_tick() % 2 == 0 || self.tracks.is_empty() {
-            let looking_at_known_track = || {
-                self.tracks.iter().find(|t| {
-                    oa::angle_diff(heading_to(t.pos_in(oa::TICK_LENGTH)), self.search_heading).abs()
-                        < 0.5 * self.search_fov
-                })
-            };
+            self.search.tick(&self.tracks);
+            //let looking_at_known_track = || {
+            //    self.tracks.iter().find(|t| {
+            //        oa::angle_diff(heading_to(t.pos_in(oa::TICK_LENGTH)), self.search_heading).abs()
+            //            < 0.5 * self.search_fov
+            //    })
+            //};
 
-            oa::set_radar_heading(self.search_heading);
-            oa::set_radar_width(self.search_fov);
-            if let Some(min_dist) = self.next_search_behind.take() {
-                oa::set_radar_min_distance(min_dist);
-                oa::set_radar_max_distance(f64::MAX);
-                self.next_search_heading();
-            } else if let Some(t) = looking_at_known_track() {
-                oa::set_radar_min_distance(0.0);
-                oa::set_radar_max_distance(
-                    t.pos_in(oa::TICK_LENGTH).distance(oa::position())
-                        - t.error_in(oa::TICK_LENGTH)
-                        - class_radius(t.class()),
-                );
-                self.next_search_behind = Some(
-                    t.pos_in(3.0 * oa::TICK_LENGTH).distance(oa::position())
-                        + t.error_in(3.0 * oa::TICK_LENGTH)
-                        + class_radius(t.class()),
-                );
-            } else {
-                oa::set_radar_min_distance(0.0);
-                oa::set_radar_max_distance(f64::MAX);
-                self.next_search_heading();
-            }
+            //oa::set_radar_heading(self.search_heading);
+            //oa::set_radar_width(self.search_fov);
+            //if let Some(min_dist) = self.next_search_behind.take() {
+            //    oa::set_radar_min_distance(min_dist);
+            //    oa::set_radar_max_distance(f64::MAX);
+            //    self.next_search_heading();
+            //} else if let Some(t) = looking_at_known_track() {
+            //    oa::set_radar_min_distance(0.0);
+            //    oa::set_radar_max_distance(
+            //        t.pos_in(oa::TICK_LENGTH).distance(oa::position())
+            //            - t.error_in(oa::TICK_LENGTH)
+            //            - class_radius(t.class()),
+            //    );
+            //    self.next_search_behind = Some(
+            //        t.pos_in(3.0 * oa::TICK_LENGTH).distance(oa::position())
+            //            + t.error_in(3.0 * oa::TICK_LENGTH)
+            //            + class_radius(t.class()),
+            //    );
+            //} else {
+            //    oa::set_radar_min_distance(0.0);
+            //    oa::set_radar_max_distance(f64::MAX);
+            //    self.next_search_heading();
+            //}
         } else {
             let t = &self.tracks[self.track_idx % self.tracks.len()];
             self.tracked_id = Some(t.id());
             self.track_idx += 1;
 
-            let p = t.pos_in(oa::TICK_LENGTH);
-            let e = t.error_in(oa::TICK_LENGTH);
-            let d = distance_to(p);
-            let r = class_radius(t.class());
-
-            oa::set_radar_heading(heading_to(p));
-            oa::set_radar_width((2.0 * (e + r) / d).min(self.search_fov));
-            oa::set_radar_min_distance(d - e - r);
-            oa::set_radar_max_distance(d + e + r);
+            set_to_track(t, self.max_track_width);
         }
     }
 
-    fn next_search_heading(&mut self) {
-        match self.search_dir {
-            SearchDirection::Cw => self.search_heading -= self.search_fov,
-            SearchDirection::Ccw => self.search_heading += self.search_fov,
-        }
-        let Some((ccw_lim, cw_lim)) = self.search_limit else {
-            return;
-        };
-        if (self.search_heading + 0.5 * self.search_fov) >= ccw_lim {
-            self.search_heading = ccw_lim - 0.5 * self.search_fov;
-            self.search_dir = SearchDirection::Cw;
-        } else if (self.search_heading - 0.5 * self.search_fov) <= cw_lim {
-            self.search_heading = cw_lim + 0.5 * self.search_fov;
-            self.search_dir = SearchDirection::Ccw;
-        }
-    }
     fn evict_tracks(&mut self) {
         self.tracks
             .retain(|t| !t.timed_out() || self.tracked_id.map_or(false, |id| t.id() == id));
@@ -171,7 +151,7 @@ impl Radar {
             return;
         };
 
-        let error = scan_error_heuristic(contact.rssi, contact.snr);
+        let error = scan_error_heuristic(&contact);
 
         let same_track = |track: &Track| {
             if track.class() != contact.class {
@@ -192,8 +172,4 @@ impl Radar {
     fn debug_tracks(&self) {
         self.tracks.iter().for_each(Track::debug);
     }
-}
-
-pub fn scan_error_heuristic(rssi: f64, snr: f64) -> f64 {
-    (rssi / snr).powi(2)
 }

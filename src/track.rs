@@ -1,4 +1,4 @@
-use crate::{elapsed, position_in, radar::scan_error_heuristic, roots, F64Ord};
+use crate::{elapsed, position_in, radar_util::scan_error_heuristic, roots, F64Ord};
 use oort_api::{
     prelude::{self as oa, maths_rs::prelude::Base, ScanResult, Vec2, Vec2Extras},
     Class,
@@ -52,7 +52,7 @@ pub struct Track {
 
 impl Track {
     pub fn new(id: u64, contact: &ScanResult) -> Self {
-        let error = scan_error_heuristic(contact.rssi, contact.snr);
+        let error = scan_error_heuristic(contact);
         let error = Vec2::new(error, error);
         Self {
             state: TrackState {
@@ -189,7 +189,7 @@ impl Track {
         if contact.class != self.class {
             return;
         }
-        let noise = scan_error_heuristic(contact.rssi, contact.snr);
+        let noise = scan_error_heuristic(contact);
         self.state.update(
             contact.position,
             contact.velocity,

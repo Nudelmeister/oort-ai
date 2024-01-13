@@ -1,6 +1,6 @@
 use crate::{
     direction_to, distance_to, elapsed, heading_to, position_in,
-    radar::SearchDirection,
+    radar_util::{set_to_track, ConeSearch},
     track::{class_radius, Track},
     Aimbot,
 };
@@ -25,48 +25,33 @@ const TERMINAL_FUEL: f64 = 750.0;
 const PROGRAM_FUEL: f64 = MAX_FUEL - TERMINAL_FUEL;
 
 pub struct MissileRadar {
-    search_dir: SearchDirection,
     track: Option<Track>,
+    search: ConeSearch,
 }
 
 impl MissileRadar {
     fn tick(&mut self, guessed_heading: Option<f64>, fov: f64, max_angle: f64) {
+        if self.track.is_none() {
+            if let Some(contact) = oa::scan() {
+                if contact.class != Class::Missile {
+                    self.track = Some(Track::new(0, &contact));
+                }
+            }
+        }
+
         if self.track.is_some() {
             self.tick_locked(fov);
             return;
-        } else if let Some(heading) = guessed_heading {
-            oa::set_radar_max_distance(f64::MAX);
-            oa::set_radar_min_distance(0.0);
-            oa::set_radar_width(fov);
-            self.next_search_heading(heading, fov, max_angle);
-        } else {
-            oa::set_radar_max_distance(f64::MAX);
-            oa::set_radar_min_distance(0.0);
-            oa::set_radar_heading(oa::radar_heading() + fov);
-            oa::set_radar_width(fov);
-        }
-        if let Some(contact) = oa::scan() {
-            self.track = Some(Track::new(0, &contact));
-            //if contact.class != Class::Missile {
-            //    self.track = Some(Track::new(0, &contact));
-            //}
-        }
-    }
-    fn next_search_heading(&mut self, heading: f64, fov: f64, max_angle: f64) {
-        let mut search_heading = oa::radar_heading();
-        match self.search_dir {
-            SearchDirection::Cw => search_heading -= fov,
-            SearchDirection::Ccw => search_heading += fov,
         }
 
-        if oa::angle_diff(search_heading + 0.5 * fov, heading).abs() >= max_angle {
-            search_heading = heading + max_angle - 0.5 * fov;
-            self.search_dir = SearchDirection::Cw;
-        } else if oa::angle_diff(search_heading - 0.5 * fov, heading).abs() >= max_angle {
-            search_heading = heading - max_angle + 0.5 * fov;
-            self.search_dir = SearchDirection::Ccw;
+        self.search.set_max_angle(max_angle);
+        if let Some(heading) = guessed_heading {
+            self.search.set_heading(heading);
+        } else {
+            self.search
+                .set_heading(heading_to(oa::position() + oa::velocity()));
         }
-        oa::set_radar_heading(search_heading);
+        self.search.tick(&[]);
     }
     fn tick_locked(&mut self, max_fov: f64) {
         let Some(track) = self.track.as_mut() else {
@@ -79,15 +64,7 @@ impl MissileRadar {
             }
         }
 
-        let p = track.pos_in(oa::TICK_LENGTH) - oa::velocity() * oa::TICK_LENGTH;
-        let e = track.error_in(oa::TICK_LENGTH);
-        let d = distance_to(p);
-        let r = class_radius(track.class());
-
-        oa::set_radar_heading(heading_to(p));
-        oa::set_radar_width((2.0 * (e + r) / d).min(max_fov));
-        oa::set_radar_min_distance(d - e - r);
-        oa::set_radar_max_distance(d + e + r);
+        set_to_track(track, max_fov);
 
         if track.error() > 1000.0 {
             self.track = None;
@@ -98,7 +75,6 @@ impl MissileRadar {
 pub struct Missile {
     program: Option<MissileProgram>,
     program_receive_time: f64,
-    terminal: bool,
     radar: MissileRadar,
     aimbot: Aimbot,
 }
@@ -108,10 +84,9 @@ impl Missile {
         Self {
             program: None,
             program_receive_time: 0.0,
-            terminal: false,
             radar: MissileRadar {
                 track: None,
-                search_dir: SearchDirection::Ccw,
+                search: ConeSearch::new(0.01 * TAU, 0.1 * TAU, 0.0),
             },
             aimbot: Aimbot::new(),
         }

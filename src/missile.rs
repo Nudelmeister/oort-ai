@@ -20,9 +20,9 @@ pub const FRAG_RANGE: f64 = 150.0;
 pub const FRAG_SPEED: f64 = FRAG_RANGE / FRAG_LIFE;
 pub const FRAG_LETHAL_RANGE: f64 = 100.0;
 
-const MAX_FUEL: f64 = 2000.0;
-const TERMINAL_FUEL: f64 = 750.0;
-const PROGRAM_FUEL: f64 = MAX_FUEL - TERMINAL_FUEL;
+const FUEL_TOTAL: f64 = 2000.0;
+const FUEL_TERMINAL: f64 = 1000.0;
+const FUEL_PROGRAM: f64 = FUEL_TOTAL - FUEL_TERMINAL;
 
 pub struct MissileRadar {
     track: Option<Track>,
@@ -131,7 +131,7 @@ impl Missile {
                 .map_or(false, |t| t.error() < 10.0 * class_radius(t.class()))
         {
             self.tick_terminal();
-        } else if MAX_FUEL - oa::fuel() < PROGRAM_FUEL {
+        } else if FUEL_TOTAL - oa::fuel() < FUEL_PROGRAM {
             oa::draw_square(point, 250.0, 0xa0a0a0);
             let vel_towards = oa::velocity().dot(direction_to(point));
             let eta = distance_to(point) / vel_towards;
@@ -167,7 +167,7 @@ impl Missile {
             .map_or(false, |t| t.error() < 10.0 * class_radius(t.class()))
         {
             self.tick_terminal();
-        } else if MAX_FUEL - oa::fuel() < PROGRAM_FUEL {
+        } else if FUEL_TOTAL - oa::fuel() < FUEL_PROGRAM {
             oa::draw_square(p_tti, 250.0, 0xa0a0a0);
             oa::torque(self.aimbot.aim_at_torque(p_tti, 0.0));
             oa::accelerate(direction_to(p_tti) * oa::max_forward_acceleration());
@@ -183,7 +183,7 @@ impl Missile {
             .map_or(false, |t| t.error() < 10.0 * class_radius(t.class()))
         {
             self.tick_terminal();
-        } else if MAX_FUEL - oa::fuel() < PROGRAM_FUEL {
+        } else if FUEL_TOTAL - oa::fuel() < FUEL_PROGRAM {
             let heading_dir = Vec2::new(1.0, 0.0).rotate(heading);
             oa::torque(self.aimbot.aim_at_torque(oa::position() + heading_dir, 0.0));
             oa::accelerate(heading_dir * oa::max_forward_acceleration());

@@ -1,6 +1,6 @@
 use crate::{
-    distance_to, heading_to,
-    track::{class_radius, Track},
+    distance_to, elapsed, heading_to,
+    track::{class_radius, class_timeout, Track},
     F64Ord,
 };
 use oort_api::prelude::{self as oa, Vec2Extras};
@@ -96,7 +96,7 @@ impl Radar {
             let r = class_radius(t.class());
 
             oa::set_radar_heading(heading_to(p));
-            oa::set_radar_width(2.0 * (e + r) / d);
+            oa::set_radar_width((2.0 * (e + r) / d).min(self.search_fov));
             oa::set_radar_min_distance(d - e - r);
             oa::set_radar_max_distance(d + e + r);
         }
@@ -156,13 +156,13 @@ impl Radar {
         };
         if let Some(contact) = oa::scan() {
             track.scan_update(&contact);
-            //} else if elapsed(track.last_seen()) > 0.1 * class_timeout(track.class())
-            //    && track.error() < 100.0
-            //{
-            //    let id = track.id();
-            //    if let Some(idx) = self.tracks.iter().position(|t| t.id() == id) {
-            //        self.tracks.swap_remove(idx);
-            //    }
+        } else if elapsed(track.last_seen()) > 0.1 * class_timeout(track.class())
+            && track.error() < 25.0
+        {
+            let id = track.id();
+            if let Some(idx) = self.tracks.iter().position(|t| t.id() == id) {
+                self.tracks.swap_remove(idx);
+            }
         }
     }
 

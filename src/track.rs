@@ -160,6 +160,7 @@ impl Track {
             .copied()
             .filter(|r| *r > 0.0)
             .min_by_key(|r| F64Ord(*r))
+        //.map(|t| t - oa::TICK_LENGTH)
     }
 
     pub fn same_track(&self, other: &Self) -> bool {
